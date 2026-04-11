@@ -829,14 +829,15 @@ async def menu_equipment(callback: CallbackQuery, config: Config, db: Database) 
         return
 
     first_photo = _file(photos[0])
+    cap = _truncate_html(caption, 1024)
+    # Подпись обязательно в том же вызове, что и media — иначе Telegram сбрасывает caption.
     await callback.message.edit_media(
-        media=InputMediaPhoto(media=first_photo),
+        media=InputMediaPhoto(
+            media=first_photo,
+            caption=cap,
+            parse_mode=ParseMode.HTML,
+        ),
         reply_markup=equipment_carousel_kb(0, total),
-    )
-    await callback.message.edit_caption(
-        caption,
-        reply_markup=equipment_carousel_kb(0, total),
-        parse_mode=ParseMode.HTML,
     )
     await callback.answer()
 
@@ -861,15 +862,14 @@ async def equipment_nav(callback: CallbackQuery, config: Config, db: Database) -
         return
     idx = idx % total
     photo = _file(photos[idx])
+    cap = _truncate_html(await equipment_caption_html(db, config), 1024)
     await callback.message.edit_media(
-        media=InputMediaPhoto(media=photo),
+        media=InputMediaPhoto(
+            media=photo,
+            caption=cap,
+            parse_mode=ParseMode.HTML,
+        ),
         reply_markup=equipment_carousel_kb(idx, total),
-    )
-    cap = await equipment_caption_html(db, config)
-    await callback.message.edit_caption(
-        cap,
-        reply_markup=equipment_carousel_kb(idx, total),
-        parse_mode=ParseMode.HTML,
     )
     await callback.answer()
 
