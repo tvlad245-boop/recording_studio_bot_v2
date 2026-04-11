@@ -21,13 +21,27 @@ from aiogram.types import (
     Message,
 )
 
-from config import Config, payments_inbox_chat_id
+from config import Config
 from database.db import Database
+from services.channel_settings import (
+    effective_payments_inbox_chat_id,
+    effective_schedule_channel_id,
+    effective_subscription_channel_id,
+    effective_subscription_channel_link,
+)
 from services.content_settings import (
     equipment_caption_html,
     equipment_photo_paths,
     format_maker_username as _format_maker_username,
     post_payment_contact_block_html,
+    studio_address_html,
+    studio_directions_video_file_id,
+    ui_photo_main_menu,
+    ui_photo_payment,
+    ui_photo_prices,
+    ui_photo_tariff_category,
+    ui_photo_tariff_day,
+    ui_photo_tariff_night,
 )
 from keyboards import (
     back_to_menu_kb,
@@ -60,6 +74,27 @@ def _truncate_html(text: str, limit: int) -> str:
         return t
     cut = max(1, limit - 10)
     return t[:cut].rstrip() + "…"
+
+
+async def _send_studio_directions_to_user(bot: Bot, db: Database, user_id: int) -> None:
+    """После подтверждения оплаты — отдельное видео с подписью (адрес в подписи, если задан)."""
+    vid = await studio_directions_video_file_id(db)
+    if not vid:
+        return
+    addr = await studio_address_html(db)
+    cap = "<b>Как пройти до студии</b>"
+    if addr:
+        cap = f"{cap}\n\n{addr}"
+    cap = _truncate_html(cap, 1024)
+    try:
+        await bot.send_video(
+            user_id,
+            video=vid,
+            caption=cap,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 def _fit_message_text_for_edit(message: Message, text: str) -> str:
@@ -150,7 +185,9 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
     - задачи текстовика
     - задачи битмейкера
     """
-    if not cfg.schedule_channel_id:
+    s = await db.get_all_settings()
+    sch_id = effective_schedule_channel_id(s, cfg)
+    if not sch_id:
         return
     from datetime import date as _d, timedelta as _td
 
@@ -183,7 +220,9 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
         lines.append(legend)
         lines.append("<pre>" + "\n".join(html_escape(x) for x in table_lines).strip() + "</pre>")
         lines.append("")
-    await _upsert_channel_message(bot, db, key="schedule_week_7d", chat_id=cfg.schedule_channel_id, text="\n".join(lines).strip())
+    await _upsert_channel_message(
+        bot, db, key="schedule_week_7d", chat_id=sch_id, text="\n".join(lines).strip()
+    )
 
     async def _tasks(kind: str, title: str) -> str:
         orders = await db.get_active_service_orders(kind)
@@ -213,14 +252,14 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
         bot,
         db,
         key="tasks_lyrics",
-        chat_id=cfg.schedule_channel_id,
+        chat_id=sch_id,
         text=await _tasks("lyrics", "📝 Задачи текстовика"),
     )
     await _upsert_channel_message(
         bot,
         db,
         key="tasks_beat",
-        chat_id=cfg.schedule_channel_id,
+        chat_id=sch_id,
         text=await _tasks("beat", "🎚️ Задачи битмейкера"),
     )
 
@@ -295,6 +334,9 @@ async def finalize_confirmed_payment(
             f"{html_escape(str(row.get('end_time', '—')))}\n"
             f"<b>Сумма:</b> {row.get('total_price', 0)} руб"
         )
+        addr = await studio_address_html(db)
+        if addr:
+            entry += f"\n<b>Адрес студии:</b> {addr}"
     await _upsert_user_success_summary(
         bot,
         db,
@@ -303,6 +345,8 @@ async def finalize_confirmed_payment(
         config=cfg,
         new_entry_html=entry,
     )
+    if kind in (None, "studio"):
+        await _send_studio_directions_to_user(bot, db, uid)
     await _publish_weekly_and_tasks(bot, db, cfg)
     return True, "ok"
 
@@ -513,6 +557,7 @@ async def _present_main_menu_on_message(
     chat_id: int,
     message_id: int,
     config: Config,
+    db: Database,
     extra_top_html: str | None = None,
 ) -> None:
     """Главное меню с картинкой MAIN_MENU_PHOTO_PATH (как после /start), в т.ч. после оплаты или раздела «Оборудование»."""
@@ -521,7 +566,8 @@ async def _present_main_menu_on_message(
     else:
         text = "<b>🏠 Главное меню</b>"
     cap = _truncate_html(text, 1024)
-    main_photo = _file(config.main_menu_photo_path)
+    s = await db.get_all_settings()
+    main_photo = _file(ui_photo_main_menu(s, config))
     if main_photo:
         try:
             await bot.edit_message_media(
@@ -640,7 +686,8 @@ async def _upsert_user_success_summary(
     prev_mid = int(row["message_id"]) if row else None
     prev_chat = int(row["chat_id"]) if row else chat_id
 
-    main_photo = _file(config.main_menu_photo_path)
+    s = await db.get_all_settings()
+    main_photo = _file(ui_photo_main_menu(s, config))
 
     if main_photo:
         media = InputMediaPhoto(
@@ -722,7 +769,9 @@ async def _upsert_user_success_summary(
 
 
 async def _post_schedule_to_channel(bot, db: Database, cfg: Config, day: str) -> None:
-    if not cfg.schedule_channel_id:
+    s = await db.get_all_settings()
+    sch_id = effective_schedule_channel_id(s, cfg)
+    if not sch_id:
         return
     if not day or day == "service":
         return
@@ -736,7 +785,7 @@ async def _post_schedule_to_channel(bot, db: Database, cfg: Config, day: str) ->
                 f"🔴 {row['start_time']} - {row['end_time']} занято "
                 f"({row.get('user_name','')} {row.get('phone','')})"
             )
-    await bot.send_message(cfg.schedule_channel_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+    await bot.send_message(sch_id, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @router.message(F.text == "/start")
@@ -744,7 +793,8 @@ async def start(message: Message, state: FSMContext, config: Config, db: Databas
     await state.clear()
     await db.delete_user_activity_message(message.from_user.id)
     caption = "<b>🎧 Студия звукозаписи</b>\nВыберите действие в меню ниже."
-    photo = _file(config.main_menu_photo_path)
+    s = await db.get_all_settings()
+    photo = _file(ui_photo_main_menu(s, config))
     if photo:
         await message.answer_photo(photo=photo, caption=caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
     else:
@@ -752,7 +802,7 @@ async def start(message: Message, state: FSMContext, config: Config, db: Databas
 
 
 @router.callback_query(F.data == "menu:home")
-async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, db: Database) -> None:
     data = await state.get_data()
     prompt_id = data.get("brief_prompt_message_id")
     root_id = data.get("payment_root_message_id") or data.get("brief_root_message_id")
@@ -772,13 +822,17 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config) 
         chat_id=chat_id,
         message_id=target_mid,
         config=config,
+        db=db,
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "menu:prices")
-async def menu_prices(callback: CallbackQuery, config: Config, pricing: EffectivePricing) -> None:
-    prices_photo = _file(config.prices_photo_path)
+async def menu_prices(
+    callback: CallbackQuery, config: Config, db: Database, pricing: EffectivePricing
+) -> None:
+    s = await db.get_all_settings()
+    prices_photo = _file(ui_photo_prices(s, config))
     if getattr(callback.message, "photo", None) and prices_photo:
         try:
             await callback.message.edit_media(
@@ -882,11 +936,14 @@ async def booking_start(
     await state.update_data(root_message_id=callback.message.message_id)
     await state.update_data(tg_username=callback.from_user.username or "")
 
-    if not await is_subscribed(callback.bot, config.channel_id, user_id):
+    s = await db.get_all_settings()
+    sub_ch = effective_subscription_channel_id(s, config)
+    sub_link = effective_subscription_channel_link(s, config)
+    if not await is_subscribed(callback.bot, sub_ch, user_id):
         await _edit(
             callback.message,
             "Для записи необходимо подписаться на канал",
-            reply_markup=subscription_kb(config.channel_link),
+            reply_markup=subscription_kb(sub_link),
         )
         await callback.answer()
         return
@@ -923,7 +980,7 @@ async def pick_product(
                 show_alert=True,
             )
             return
-        await show_studio_mode(callback, state, config)
+        await show_studio_mode(callback, state, config, db)
         await callback.answer()
         return
 
@@ -947,12 +1004,13 @@ async def pick_product(
         "  — ваш @username в Telegram (или «—» если без username)\n\n"
         f"<b>Стоимость:</b> {price} руб"
     )
+    s = await db.get_all_settings()
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
         chat_id=chat_id,
         text=screen,
         reply_markup=back_to_menu_kb(),
-        photo_path=config.payment_photo_path,
+        photo_path=ui_photo_payment(s, config),
     )
     await state.update_data(
         payment_root_message_id=sent_id,
@@ -969,7 +1027,9 @@ async def sub_check(
     db: Database,
     pricing: EffectivePricing,
 ) -> None:
-    if await is_subscribed(callback.bot, config.channel_id, callback.from_user.id):
+    s = await db.get_all_settings()
+    sub_ch = effective_subscription_channel_id(s, config)
+    if await is_subscribed(callback.bot, sub_ch, callback.from_user.id):
         data = await state.get_data()
         prod = data.get("product")
         if prod == "no_engineer" and not pricing.service_no_engineer_enabled:
@@ -987,17 +1047,20 @@ async def sub_check(
                 return
         await callback.answer("Подписка подтверждена", show_alert=True)
         if prod in ("no_engineer", "with_engineer"):
-            await show_studio_mode(callback, state, config)
+            await show_studio_mode(callback, state, config, db)
         else:
             await show_calendar(callback, state, db)
         return
     await callback.answer("Подписка не найдена", show_alert=True)
 
 
-async def show_studio_mode(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def show_studio_mode(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
     """Почасовая запись или тарифы (после выбора записи с/без звукорежиссёра)."""
     await state.set_state(BookingStates.choosing_studio_mode)
     await state.update_data(booking_mode=None, tariff_label=None)
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         "<b>Запись на студию</b>\n\n"
@@ -1006,7 +1069,7 @@ async def show_studio_mode(callback: CallbackQuery, state: FSMContext, config: C
         "• <b>Тарифы</b> — пакеты на 6 / 8 / 10 / 12 ч: "
         "<b>ночная</b> (с 00:00) или <b>дневная</b> (с 09:00 или 12:00).",
         studio_mode_kb(),
-        photo_path=config.main_menu_photo_path,
+        photo_path=ui_photo_main_menu(s, config),
     )
 
 
@@ -1083,8 +1146,11 @@ async def show_tariff_calendar(
     rows = list(mk.inline_keyboard)
     rows.append([InlineKeyboardButton(text="⬅ К выбору часов", callback_data="trf:cal:back")])
     kind = data.get("tariff_kind")
+    s = await db.get_all_settings()
     tariff_photo = (
-        config.tariff_night_photo_path if kind == "night" else config.tariff_day_photo_path
+        ui_photo_tariff_night(s, config)
+        if kind == "night"
+        else ui_photo_tariff_day(s, config)
     )
     await _edit_screen(
         callback,
@@ -1128,7 +1194,9 @@ async def studio_mode_hourly(callback: CallbackQuery, state: FSMContext, db: Dat
 
 
 @router.callback_query(F.data == "stm:tariff", BookingStates.choosing_studio_mode)
-async def studio_mode_tariff(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def studio_mode_tariff(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
     await state.set_state(BookingStates.choosing_tariff)
     await state.update_data(
         tariff_kind=None,
@@ -1137,65 +1205,83 @@ async def studio_mode_tariff(callback: CallbackQuery, state: FSMContext, config:
         tariff_start=None,
         tariff_label=None,
     )
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         "<b>📦 Тарифы</b>\n\nВыберите: ночная или дневная запись.",
         tariff_category_kb(),
-        photo_path=config.tariff_category_photo_path,
+        photo_path=ui_photo_tariff_category(s, config),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "stm:back", BookingStates.choosing_tariff)
-async def stm_back_to_studio_mode(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
-    await show_studio_mode(callback, state, config)
+async def stm_back_to_studio_mode(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    await show_studio_mode(callback, state, config, db)
     await callback.answer()
 
 
 @router.callback_query(F.data == "trf:c:night", BookingStates.choosing_tariff)
 async def tariff_cat_night(
-    callback: CallbackQuery, state: FSMContext, config: Config, pricing: EffectivePricing
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
 ) -> None:
     await state.update_data(tariff_kind="night")
     data = await state.get_data()
     we = data.get("product") == "with_engineer"
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         "<b>🌙 Ночная запись</b>\n\n"
         "Интервал с <b>00:00</b> (например 6 ч → 00:00–06:00, 12 ч → 00:00–12:00).\n\n"
         "Выберите длительность:",
         tariff_hours_kb(night=True, pricing=pricing, with_engineer=we),
-        photo_path=config.tariff_night_photo_path,
+        photo_path=ui_photo_tariff_night(s, config),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "trf:c:day", BookingStates.choosing_tariff)
-async def tariff_cat_day(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def tariff_cat_day(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
     await state.update_data(tariff_kind="day")
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         "<b>☀️ Дневная запись</b>\n\nС какого времени начинается сессия?",
         tariff_day_start_kb(),
-        photo_path=config.tariff_day_photo_path,
+        photo_path=ui_photo_tariff_day(s, config),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "trf:c:back", BookingStates.choosing_tariff)
-async def tariff_cat_back(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def tariff_cat_back(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         "<b>📦 Тарифы</b>\n\nВыберите: ночная или дневная запись.",
         tariff_category_kb(),
-        photo_path=config.tariff_category_photo_path,
+        photo_path=ui_photo_tariff_category(s, config),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("trf:s:"), BookingStates.choosing_tariff)
 async def tariff_day_start_pick(
-    callback: CallbackQuery, state: FSMContext, config: Config, pricing: EffectivePricing
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
 ) -> None:
     part = callback.data.split(":")[2]
     if part == "09":
@@ -1208,11 +1294,12 @@ async def tariff_day_start_pick(
     await state.update_data(tariff_day_start=start)
     data = await state.get_data()
     we = data.get("product") == "with_engineer"
+    s = await db.get_all_settings()
     await _edit_screen(
         callback,
         f"<b>☀️ Дневная запись</b> (начало в {start})\n\nВыберите длительность:",
         tariff_hours_kb(night=False, pricing=pricing, with_engineer=we),
-        photo_path=config.tariff_day_photo_path,
+        photo_path=ui_photo_tariff_day(s, config),
     )
     await callback.answer()
 
@@ -1223,11 +1310,12 @@ async def tariff_pick_hours(callback: CallbackQuery, state: FSMContext, db: Data
     if payload == "back":
         data = await state.get_data()
         if data.get("tariff_kind") == "day":
+            s = await db.get_all_settings()
             await _edit_screen(
                 callback,
                 "<b>☀️ Дневная запись</b>\n\nС какого времени начинается сессия?",
                 tariff_day_start_kb(),
-                photo_path=config.tariff_day_photo_path,
+                photo_path=ui_photo_tariff_day(s, config),
             )
         await callback.answer()
         return
@@ -1259,19 +1347,24 @@ async def tariff_pick_hours(callback: CallbackQuery, state: FSMContext, db: Data
 
 @router.callback_query(F.data == "trf:cal:back", BookingStates.choosing_tariff_date)
 async def tariff_cal_back(
-    callback: CallbackQuery, state: FSMContext, config: Config, pricing: EffectivePricing
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
 ) -> None:
     await state.update_data(tariff_hours=None, tariff_start=None)
     await state.set_state(BookingStates.choosing_tariff)
     data = await state.get_data()
     we = data.get("product") == "with_engineer"
     kind = data.get("tariff_kind")
+    s = await db.get_all_settings()
     if kind == "night":
         await _edit_screen(
             callback,
             "<b>🌙 Ночная запись</b>\n\nВыберите длительность:",
             tariff_hours_kb(night=True, pricing=pricing, with_engineer=we),
-            photo_path=config.tariff_night_photo_path,
+            photo_path=ui_photo_tariff_night(s, config),
         )
     elif kind == "day":
         start = data.get("tariff_day_start") or "09:00"
@@ -1279,7 +1372,7 @@ async def tariff_cal_back(
             callback,
             f"<b>☀️ Дневная запись</b> (начало в {start})\n\nВыберите длительность:",
             tariff_hours_kb(night=False, pricing=pricing, with_engineer=we),
-            photo_path=config.tariff_day_photo_path,
+            photo_path=ui_photo_tariff_day(s, config),
         )
     await callback.answer()
 
@@ -1360,12 +1453,13 @@ async def pick_tariff_date(
         "Сбербанк\n"
         "@nickname</i>"
     )
+    s = await db.get_all_settings()
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
         chat_id=chat_id,
         text=screen1,
         reply_markup=back_to_menu_kb(),
-        photo_path=config.payment_photo_path,
+        photo_path=ui_photo_payment(s, config),
     )
     await state.update_data(
         payment_root_message_id=sent_id,
@@ -1514,12 +1608,13 @@ async def slot_confirm(
         "Сбербанк\n"
         "@nickname</i>"
     )
+    s = await db.get_all_settings()
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
         chat_id=chat_id,
         text=screen1,
         reply_markup=back_to_menu_kb(),
-        photo_path=config.payment_photo_path,
+        photo_path=ui_photo_payment(s, config),
     )
     await state.update_data(
         payment_root_message_id=sent_id,
@@ -1528,7 +1623,9 @@ async def slot_confirm(
     )
 
 @router.message(BookingStates.entering_brief)
-async def enter_brief(message: Message, state: FSMContext, config: Config, pricing: EffectivePricing) -> None:
+async def enter_brief(
+    message: Message, state: FSMContext, config: Config, db: Database, pricing: EffectivePricing
+) -> None:
     raw = (message.text or "").strip()
     data = await state.get_data()
     product = data.get("product")
@@ -1587,6 +1684,8 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
         )
         cid = message.chat.id
         mid = int(root_mid)
+        s = await db.get_all_settings()
+        pay_path = ui_photo_payment(s, config)
         try:
             await _edit_payment_screen_message(
                 message.bot,
@@ -1605,7 +1704,7 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
                     chat_id=cid,
                     text=pay_screen,
                     reply_markup=paid_kb(),
-                    photo_path=config.payment_photo_path,
+                    photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
         except Exception:
@@ -1614,7 +1713,7 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
                 chat_id=cid,
                 text=pay_screen,
                 reply_markup=paid_kb(),
-                photo_path=config.payment_photo_path,
+                photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
     # Можно удалить сообщение пользователя после успешной оплаты — сохраним id
@@ -1624,7 +1723,9 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
 
 
 @router.message(BookingStates.entering_contacts)
-async def enter_contacts(message: Message, state: FSMContext, config: Config, pricing: EffectivePricing) -> None:
+async def enter_contacts(
+    message: Message, state: FSMContext, config: Config, db: Database, pricing: EffectivePricing
+) -> None:
     raw = (message.text or "").strip()
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     if len(lines) < 4:
@@ -1679,6 +1780,8 @@ async def enter_contacts(message: Message, state: FSMContext, config: Config, pr
     is_photo = data.get("payment_root_is_photo", False)
     cid = message.chat.id
     if root_mid:
+        s = await db.get_all_settings()
+        pay_path = ui_photo_payment(s, config)
         try:
             await _edit_payment_screen_message(
                 message.bot,
@@ -1697,7 +1800,7 @@ async def enter_contacts(message: Message, state: FSMContext, config: Config, pr
                     chat_id=cid,
                     text=screen2,
                     reply_markup=paid_kb(),
-                    photo_path=config.payment_photo_path,
+                    photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
         except Exception:
@@ -1706,7 +1809,7 @@ async def enter_contacts(message: Message, state: FSMContext, config: Config, pr
                 chat_id=cid,
                 text=screen2,
                 reply_markup=paid_kb(),
-                photo_path=config.payment_photo_path,
+                photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
 
@@ -1759,7 +1862,8 @@ async def paid(
                     chat_id, waiting, parse_mode=ParseMode.HTML
                 )
 
-    inbox = payments_inbox_chat_id(config)
+    s = await db.get_all_settings()
+    inbox = effective_payments_inbox_chat_id(s, config)
 
     if product in ("lyrics", "beat"):
         svc_title = pricing.service_title(product)
@@ -1876,7 +1980,9 @@ def _booking_type_title(kind: str | None) -> str:
     return k
 
 
-def _format_my_bookings_screen(rows: list[dict], config: Config) -> str:
+def _format_my_bookings_screen(
+    rows: list[dict], config: Config, *, studio_address_html: str = ""
+) -> str:
     def sort_key(b: dict) -> tuple[int, int]:
         k = b.get("booking_kind") or "studio"
         order = {"studio": 0, "lyrics": 1, "beat": 2}.get(k, 9)
@@ -1923,6 +2029,8 @@ def _format_my_bookings_screen(rows: list[dict], config: Config) -> str:
                 f"<b>Дата:</b> {html_escape(str(b.get('day', '—')))}  |  "
                 f"<b>Время:</b> {html_escape(str(b['start_time']))} — {html_escape(str(b['end_time']))}"
             )
+            if studio_address_html:
+                lines.append(f"<b>Адрес студии:</b> {studio_address_html}")
             lines.append(
                 f"<b>Имя:</b> {html_escape(str(b.get('user_name', '—')))}  |  "
                 f"<b>Банк:</b> {html_escape(str(b.get('phone', '—')))}"
@@ -1945,10 +2053,55 @@ async def my_booking(callback: CallbackQuery, db: Database, config: Config) -> N
         )
         await callback.answer()
         return
-    text = _format_my_bookings_screen(rows, config)
+    addr = await studio_address_html(db)
+    text = _format_my_bookings_screen(rows, config, studio_address_html=addr)
     ids = [int(b["id"]) for b in rows]
-    await _present_my_bookings_message(callback, text, my_bookings_kb(ids))
+    has_studio = any((b.get("booking_kind") or "studio") == "studio" for b in rows)
+    await _present_my_bookings_message(
+        callback,
+        text,
+        my_bookings_kb(ids, show_directions=has_studio),
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data == "book:directions")
+async def book_directions_to_studio(callback: CallbackQuery, db: Database) -> None:
+    rows = await db.get_user_active_bookings(callback.from_user.id)
+    has_studio = any((b.get("booking_kind") or "studio") == "studio" for b in rows)
+    if not has_studio:
+        await callback.answer("Нет активной записи на студию", show_alert=True)
+        return
+    vid = await studio_directions_video_file_id(db)
+    addr = await studio_address_html(db)
+    if not vid and not addr:
+        await callback.answer("Маршрут ещё не настроен администратором", show_alert=True)
+        return
+    await callback.answer()
+    uid = callback.from_user.id
+    if vid:
+        cap = "<b>Как пройти до студии</b>"
+        if addr:
+            cap = f"{cap}\n\n{addr}"
+        cap = _truncate_html(cap, 1024)
+        try:
+            await callback.bot.send_video(
+                uid,
+                video=vid,
+                caption=cap,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback.bot.send_message(
+                uid,
+                "Не удалось отправить видео. Напишите администратору.",
+            )
+    else:
+        await callback.bot.send_message(
+            uid,
+            _truncate_html(f"<b>Адрес студии</b>\n\n{addr}", 4096),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.callback_query(F.data.startswith("book:cancel:"))
@@ -1974,6 +2127,7 @@ async def cancel_own(callback: CallbackQuery, db: Database, config: Config, remi
         chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
         config=config,
+        db=db,
         extra_top_html=extra_top,
     )
     await _publish_weekly_and_tasks(callback.bot, db, config)

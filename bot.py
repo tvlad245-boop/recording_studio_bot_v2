@@ -32,7 +32,9 @@ async def main() -> None:
 
     scheduler = AsyncIOScheduler(timezone=cfg.timezone)
     scheduler.start()
-    reminder_service = ReminderService(scheduler=scheduler, db=db, bot=bot)
+    reminder_service = ReminderService(
+        scheduler=scheduler, db=db, bot=bot, timezone=cfg.timezone
+    )
     await reminder_service.restore_jobs()
 
     register_pricing_middleware(user_router)

@@ -43,6 +43,40 @@ async def equipment_caption_html(db: Database, cfg: Config) -> str:
     )
 
 
+def _ui_photo_path(settings: dict[str, str], cfg: Config, setting_key: str, config_attr: str) -> str:
+    """Путь к картинке: из bot_settings, иначе из Config (.env)."""
+    raw = (settings.get(setting_key) or "").strip()
+    if raw:
+        ap = os.path.abspath(raw)
+        if os.path.isfile(ap):
+            return ap
+    return (getattr(cfg, config_attr, None) or "").strip()
+
+
+def ui_photo_main_menu(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_main_menu_path", "main_menu_photo_path")
+
+
+def ui_photo_prices(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_prices_path", "prices_photo_path")
+
+
+def ui_photo_payment(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_payment_path", "payment_photo_path")
+
+
+def ui_photo_tariff_category(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_tariff_category_path", "tariff_category_photo_path")
+
+
+def ui_photo_tariff_night(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_tariff_night_path", "tariff_night_photo_path")
+
+
+def ui_photo_tariff_day(settings: dict[str, str], cfg: Config) -> str:
+    return _ui_photo_path(settings, cfg, "ui_photo_tariff_day_path", "tariff_day_photo_path")
+
+
 def equipment_photo_paths(settings: dict[str, str], cfg: Config) -> list[str]:
     raw = (settings.get("equipment_photos_raw") or "").strip()
     out: list[str] = []
@@ -57,6 +91,17 @@ def equipment_photo_paths(settings: dict[str, str], cfg: Config) -> list[str]:
     if out:
         return out
     return list(cfg.equipment_photos)
+
+
+async def studio_address_html(db: Database) -> str:
+    """HTML из админки; пусто — адрес не показываем."""
+    s = await db.get_all_settings()
+    return (s.get("studio_address_html") or "").strip()
+
+
+async def studio_directions_video_file_id(db: Database) -> str:
+    s = await db.get_all_settings()
+    return (s.get("studio_directions_video_file_id") or "").strip()
 
 
 async def post_payment_contact_block_html(db: Database, cfg: Config, *, kind: str) -> str:

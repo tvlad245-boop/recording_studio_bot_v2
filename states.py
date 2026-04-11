@@ -21,4 +21,7 @@ class AdminStates(StatesGroup):
     price_wait_value = State()
     toggle_slots_pick = State()
     wait_setting_text = State()
+    equipment_photo_wait = State()
+    directions_video_wait = State()
+    ui_photo_wait = State()
 

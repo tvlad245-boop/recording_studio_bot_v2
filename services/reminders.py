@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,26 +11,42 @@ from database.db import Database
 
 
 class ReminderService:
-    def __init__(self, scheduler: AsyncIOScheduler, db: Database, bot: Bot) -> None:
+    def __init__(
+        self,
+        scheduler: AsyncIOScheduler,
+        db: Database,
+        bot: Bot,
+        *,
+        timezone: str = "UTC",
+    ) -> None:
         self.scheduler = scheduler
         self.db = db
         self.bot = bot
+        self._tz = ZoneInfo(timezone)
+
+    def _now(self) -> datetime:
+        return datetime.now(self._tz)
 
     async def send_reminder(self, booking_id: int) -> None:
         booking = await self.db.get_booking_by_id(booking_id)
         if not booking or booking["status"] != "active":
             return
+        day = str(booking.get("day", "—"))
+        st = str(booking.get("start_time", "—"))
+        et = str(booking.get("end_time", "—"))
         text = (
-            "Напоминаем, что вы записаны на студию звукозаписи в "
-            f"{booking['start_time']}.\n"
-            "Ждём вас ️"
+            "Напоминаем: вы арендовали студию.\n"
+            f"Дата: {day}\n"
+            f"Время: {st} — {et}\n"
+            "До начала около двух часов. Ждём вас!"
         )
         await self.bot.send_message(booking["user_id"], text)
 
     async def schedule_for_booking(self, booking: dict) -> None:
-        start_dt = self.db.booking_start_datetime(booking)
-        remind_at = start_dt - timedelta(hours=24)
-        if remind_at <= datetime.now():
+        start_naive = self.db.booking_start_datetime(booking)
+        start_dt = start_naive.replace(tzinfo=self._tz)
+        remind_at = start_dt - timedelta(hours=2)
+        if remind_at <= self._now():
             return
 
         job_id = f"booking_reminder_{booking['id']}"

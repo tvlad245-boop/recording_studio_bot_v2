@@ -4,6 +4,8 @@ import re
 from calendar import monthrange
 from datetime import date
 from html import escape as html_escape
+from pathlib import Path
+from uuid import uuid4
 
 from aiogram import Router, F
 from aiogram.enums import ParseMode
@@ -17,7 +19,13 @@ from config import Config
 from database.db import Database
 from handlers.user import delete_booking_pending_ui_messages, finalize_confirmed_payment
 from keyboards import month_calendar_kb, now_month
-from services.content_settings import setting_bool
+from services.channel_settings import (
+    effective_payments_inbox_chat_id,
+    effective_schedule_channel_id,
+    effective_subscription_channel_id,
+    effective_subscription_channel_link,
+)
+from services.content_settings import equipment_photo_paths, setting_bool
 from services.effective_pricing import EffectivePricing, load_effective_pricing
 from services.reminders import ReminderService
 from states import AdminStates
@@ -26,6 +34,46 @@ from states import AdminStates
 router = Router()
 
 ADMIN_HOME_HTML = "<b>🛠 Админ-панель</b>"
+
+# Локальные файлы, присланные админом из Telegram (абсолютные пути попадают в equipment_photos_raw)
+EQUIPMENT_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "user_uploads" / "equipment"
+UI_UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "user_uploads" / "ui"
+
+# callback_id -> (setting_key, короткая подпись для экрана)
+_UI_PHOTO_SLOTS: dict[str, tuple[str, str]] = {
+    "main_menu": ("ui_photo_main_menu_path", "Главное меню"),
+    "prices": ("ui_photo_prices_path", "Прайс"),
+    "payment": ("ui_photo_payment_path", "Оплата / реквизиты"),
+    "tariff_cat": ("ui_photo_tariff_category_path", "Тарифы: ночь/день"),
+    "tariff_night": ("ui_photo_tariff_night_path", "Тариф: ночь"),
+    "tariff_day": ("ui_photo_tariff_day_path", "Тариф: день"),
+}
+
+# Подсказка при загрузке фото в раздел «Оборудование»
+_EQUIPMENT_PHOTO_SIZE_HINT = (
+    "\n\n<i>Старайтесь выбирать изображения небольшого веса: в идеале до ~100 КБ — "
+    "так быстрее откроется у клиентов в Telegram.</i>"
+)
+
+
+def _try_delete_uploaded_file(path_str: str) -> None:
+    try:
+        p = Path(path_str).resolve()
+        p.relative_to(EQUIPMENT_UPLOAD_ROOT.resolve())
+        if p.is_file():
+            p.unlink()
+    except (ValueError, OSError):
+        pass
+
+
+def _try_delete_ui_upload(path_str: str) -> None:
+    try:
+        p = Path(path_str).resolve()
+        p.relative_to(UI_UPLOAD_ROOT.resolve())
+        if p.is_file():
+            p.unlink()
+    except (ValueError, OSError):
+        pass
 
 
 def _is_admin(user_id: int, config: Config) -> bool:
@@ -104,7 +152,8 @@ def _equipment_admin_text(settings: dict[str, str]) -> str:
         f"{mode}\n\n"
         "• <b>Свой HTML</b> — весь текст экрана.\n"
         "• <b>6 строк</b> — заголовок, описание, микрофон, аудиокарта, наушники, мониторы.\n"
-        "• <b>Пути к фото</b> — абсолютные пути Windows/Linux, по одному в строке; пусто — из .env."
+        "• <b>Загрузить фото</b> — прислать картинку в чат; лучше лёгкие файлы (в идеале до ~100 КБ).\n"
+        "• <b>Пути к фото</b> — вручную, по одному в строке; пусто — из .env."
     )
 
 
@@ -117,7 +166,9 @@ def _equipment_menu_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     )
     kb.button(text="✏️ Свой HTML", callback_data="admeq:edit_custom")
     kb.button(text="✏️ Стандарт — 6 строк", callback_data="admeq:edit_std")
-    kb.button(text="🖼 Пути к фото", callback_data="admeq:edit_photos")
+    kb.button(text="📷 Добавить фото (в конец)", callback_data="admeq:upload_append")
+    kb.button(text="🔄 Заменить фото…", callback_data="admeq:replace_menu")
+    kb.button(text="🖼 Пути к фото (текстом)", callback_data="admeq:edit_photos")
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -130,6 +181,118 @@ def _postpay_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def _studio_nav_admin_text(settings: dict[str, str]) -> str:
+    addr = (settings.get("studio_address_html") or "").strip()
+    vid = (settings.get("studio_directions_video_file_id") or "").strip()
+    addr_prev = addr if addr else "<i>не задан</i>"
+    vid_prev = "✅ загружено" if vid else "<i>нет</i>"
+    return (
+        "<b>📍 Адрес и видео «как пройти»</b>\n\n"
+        f"<b>Адрес:</b> {addr_prev}\n"
+        f"<b>Видео:</b> {vid_prev}\n\n"
+        "Адрес показывается клиенту после оплаты и в «Моя запись». "
+        "Видео отправляется после подтверждения оплаты и по кнопке «Как пройти до студии»."
+    )
+
+
+def _studio_nav_menu_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Адрес (HTML)", callback_data="admsn:edit_address")
+    kb.button(text="🎬 Загрузить / заменить видео", callback_data="admsn:upload_video")
+    if (settings.get("studio_directions_video_file_id") or "").strip():
+        kb.button(text="🗑 Удалить видео", callback_data="admsn:clear_video")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _ui_photos_admin_text(settings: dict[str, str]) -> str:
+    lines: list[str] = [
+        "<b>🖼 Картинки интерфейса</b>",
+        "",
+        "Файлы из этого раздела подставляются вместо путей из <code>.env</code>. "
+        "После «Сброса» снова используется .env.",
+        "",
+    ]
+    for _slot_id, (sk, label) in _UI_PHOTO_SLOTS.items():
+        custom = bool((settings.get(sk) or "").strip())
+        src = "свой файл" if custom else "как в .env"
+        lines.append(f"• <b>{html_escape(label)}</b>: <i>{src}</i>")
+    lines.extend(["", "<i>Лучше небольшие файлы (в идеале до ~100 КБ).</i>"])
+    return "\n".join(lines)
+
+
+def _ui_photos_menu_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for slot_id, (sk, label) in _UI_PHOTO_SLOTS.items():
+        kb.button(text=f"📷 {label}", callback_data=f"admui:{slot_id}")
+        if (settings.get(sk) or "").strip():
+            kb.button(text=f"🗑 {label}", callback_data=f"admui:clear:{slot_id}")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _channels_admin_text(settings: dict[str, str], config: Config) -> str:
+    sub_id = effective_subscription_channel_id(settings, config)
+    sub_link = effective_subscription_channel_link(settings, config)
+    sch = effective_schedule_channel_id(settings, config)
+    pay = effective_payments_inbox_chat_id(settings, config)
+    link_short = sub_link if len(sub_link) <= 72 else sub_link[:69] + "…"
+    return (
+        "<b>📡 Каналы и чаты</b>\n\n"
+        "<b>Сейчас (настройки бота поверх .env):</b>\n"
+        f"• Подписка — ID канала: <code>{sub_id}</code>\n"
+        f"• Ссылка «Подписаться»: {html_escape(link_short)}\n"
+        f"• Расписание и задачи — ID канала: <code>{sch}</code>\n"
+        f"• Подтверждения оплаты — ID чата: <code>{pay}</code>\n\n"
+        "Выберите пункт и пришлите значение одним сообщением.\n"
+        "Для ID: целое число (часто отрицательное). "
+        "Символ <code>-</code> сбрасывает свой ID и снова берёт значение из .env.\n"
+        "Для ссылки: полный URL или <code>-</code> для сброса."
+    )
+
+
+def _channels_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📢 ID канала подписки", callback_data="adch:sub_id")
+    kb.button(text="🔗 Ссылка «Подписаться»", callback_data="adch:sub_link")
+    kb.button(text="📅 Канал расписания", callback_data="adch:schedule")
+    kb.button(text="💳 Чат подтверждений оплаты", callback_data="adch:payments")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+_CHANNEL_EDIT_PROMPTS: dict[str, tuple[str, str, str]] = {
+    "sub_id": (
+        "subscription_channel_id",
+        "ID канала для проверки подписки",
+        "Целое число (например <code>-1001234567890</code>). "
+        "<code>0</code> — не требовать подписку. <code>-</code> — как в .env.",
+    ),
+    "sub_link": (
+        "subscription_channel_link",
+        "Ссылка для кнопки «Подписаться»",
+        "Например <code>https://t.me/your_channel</code>. <code>-</code> — взять из .env.",
+    ),
+    "schedule": (
+        "schedule_channel_id",
+        "Канал для расписания и задач",
+        "Сюда публикуются расписание на 7 дней и задачи текстовика/битмейкера. "
+        "<code>0</code> — не слать. <code>-</code> — как в .env.",
+    ),
+    "payments": (
+        "payments_inbox_chat_id",
+        "Чат для заявок на подтверждение оплаты",
+        "Группа или канал с заявками. <code>0</code> — в личку администратору (как в .env при пустом PAYMENTS). "
+        "<code>-</code> — сброс к .env.",
+    ),
+}
+
+_CHANNEL_SETTING_KEYS = frozenset(v[0] for v in _CHANNEL_EDIT_PROMPTS.values())
 
 
 def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
@@ -181,6 +344,9 @@ def admin_menu_kb():
     kb.button(text="🛒 Услуги вкл/выкл", callback_data="admin:services")
     kb.button(text="📸 Оборудование и фото", callback_data="admin:equipment")
     kb.button(text="📣 Текст после оплаты (текст/бит)", callback_data="admin:postpay")
+    kb.button(text="📍 Адрес и «как пройти»", callback_data="admin:studio_nav")
+    kb.button(text="🖼 Картинки интерфейса", callback_data="admin:ui_photos")
+    kb.button(text="📡 Каналы и чаты", callback_data="admin:channels")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -272,6 +438,39 @@ async def admin_actions(
             "Что видит клиент в сводке после подтверждения оплаты (заказ текста или бита). "
             "Можно HTML. Пустое значение — контакт из .env (TEXTMAKER_USERNAME / BEATMAKER_USERNAME).",
             _postpay_menu_kb(),
+        )
+        await callback.answer()
+        return
+
+    if action == "studio_nav":
+        await state.clear()
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback,
+            _studio_nav_admin_text(s),
+            _studio_nav_menu_kb(s),
+        )
+        await callback.answer()
+        return
+
+    if action == "ui_photos":
+        await state.clear()
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback,
+            _ui_photos_admin_text(s),
+            _ui_photos_menu_kb(s),
+        )
+        await callback.answer()
+        return
+
+    if action == "channels":
+        await state.clear()
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback,
+            _channels_admin_text(s, config),
+            _channels_menu_kb(),
         )
         await callback.answer()
         return
@@ -642,7 +841,68 @@ async def admin_equipment_sub(
     if not _is_admin(callback.from_user.id, config):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    sub = callback.data.split(":")[1]
+    raw_cd = callback.data
+    if raw_cd.startswith("admeq:slot:"):
+        idx = int(raw_cd.split(":")[2])
+        await state.set_state(AdminStates.equipment_photo_wait)
+        await state.update_data(
+            equipment_photo_slot=idx,
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            f"<b>Замена фото №{idx + 1}</b>\n\n"
+            "Отправьте <b>новое изображение</b> одним сообщением (как фото, не как документ)."
+            f"{_EQUIPMENT_PHOTO_SIZE_HINT}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+
+    sub = raw_cd.split(":")[1]
+    if sub == "upload_append":
+        await state.set_state(AdminStates.equipment_photo_wait)
+        await state.update_data(
+            equipment_photo_slot=None,
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Новое фото</b>\n\n"
+            "Оно будет <b>добавлено в конец</b> карусели. Пришлите изображение одним сообщением."
+            f"{_EQUIPMENT_PHOTO_SIZE_HINT}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    if sub == "replace_menu":
+        s = await db.get_all_settings()
+        paths = equipment_photo_paths(s, config)
+        if not paths:
+            await callback.answer(
+                "Пока нет фото в списке. Сначала «Добавить фото» или задайте пути в .env.",
+                show_alert=True,
+            )
+            return
+        kb = InlineKeyboardBuilder()
+        for i, p in enumerate(paths):
+            name = Path(p).name
+            if len(name) > 36:
+                name = name[:33] + "…"
+            kb.button(text=f"№{i + 1} · {name}", callback_data=f"admeq:slot:{i}")
+        kb.button(text="⬅ Назад", callback_data="admin:equipment")
+        kb.adjust(1)
+        await callback.message.edit_text(
+            "<b>Какой снимок заменить?</b>\n\n"
+            "Выберите номер, затем отправьте новое фото."
+            f"{_EQUIPMENT_PHOTO_SIZE_HINT}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+        return
     if sub == "toggle_custom":
         s = await db.get_all_settings()
         cur = setting_bool(s, "equipment_use_custom", False)
@@ -734,6 +994,281 @@ async def admin_postpay_sub(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admsn:"))
+async def admin_studio_nav_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sub = callback.data.split(":")[1]
+    if sub == "edit_address":
+        await state.set_state(AdminStates.wait_setting_text)
+        await state.update_data(
+            setting_key="studio_address_html",
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Адрес студии</b>\n\n"
+            "Одним сообщением (HTML). Показывается в сводке после оплаты и в «Моя запись». "
+            "Один символ <code>-</code> — очистить.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    if sub == "upload_video":
+        await state.set_state(AdminStates.directions_video_wait)
+        await state.update_data(
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Видео «как пройти до студии»</b>\n\n"
+            "Пришлите <b>видео</b> одним сообщением (как видео).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    if sub == "clear_video":
+        await db.set_setting("studio_directions_video_file_id", "")
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback, _studio_nav_admin_text(s), _studio_nav_menu_kb(s)
+        )
+        await callback.answer("Видео удалено")
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admui:"))
+async def admin_ui_photo_actions(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) >= 3 and parts[1] == "clear":
+        slot_id = parts[2]
+        meta = _UI_PHOTO_SLOTS.get(slot_id)
+        if not meta:
+            await callback.answer()
+            return
+        sk, _lbl = meta
+        s = await db.get_all_settings()
+        old = (s.get(sk) or "").strip()
+        if old:
+            _try_delete_ui_upload(old)
+        await db.set_setting(sk, "")
+        s2 = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback, _ui_photos_admin_text(s2), _ui_photos_menu_kb(s2)
+        )
+        await callback.answer("Сброшено")
+        return
+    if len(parts) < 2:
+        await callback.answer()
+        return
+    slot_id = parts[1]
+    meta = _UI_PHOTO_SLOTS.get(slot_id)
+    if not meta:
+        await callback.answer()
+        return
+    sk, label = meta
+    await state.set_state(AdminStates.ui_photo_wait)
+    await state.update_data(
+        ui_photo_setting_key=sk,
+        admin_panel_mid=callback.message.message_id,
+        admin_panel_cid=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"<b>Картинка: {html_escape(label)}</b>\n\n"
+        "Пришлите изображение <b>как фото</b>. Оно будет показано клиентам на соответствующем экране.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_abort_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adch:"))
+async def admin_channels_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sub = callback.data.split(":", maxsplit=1)[1]
+    meta = _CHANNEL_EDIT_PROMPTS.get(sub)
+    if not meta:
+        await callback.answer()
+        return
+    sk, title, hint = meta
+    await state.set_state(AdminStates.wait_setting_text)
+    await state.update_data(
+        setting_key=sk,
+        admin_panel_mid=callback.message.message_id,
+        admin_panel_cid=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"<b>{html_escape(title)}</b>\n\n{hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_abort_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.equipment_photo_wait, F.photo)
+async def admin_equipment_got_photo(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if not _is_admin(message.from_user.id, config):
+        await state.clear()
+        return
+    data = await state.get_data()
+    slot = data.get("equipment_photo_slot")
+    mid = data.get("admin_panel_mid")
+    cid = data.get("admin_panel_cid")
+
+    EQUIPMENT_UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    dest = EQUIPMENT_UPLOAD_ROOT / f"eq_{uuid4().hex}.jpg"
+    await message.bot.download(message.photo[-1], destination=dest)
+    new_path = str(dest.resolve())
+
+    s = await db.get_all_settings()
+    lines = list(equipment_photo_paths(s, config))
+
+    if slot is None:
+        lines.append(new_path)
+    else:
+        idx = int(slot)
+        if 0 <= idx < len(lines):
+            old_path = lines[idx]
+            _try_delete_uploaded_file(old_path)
+            lines[idx] = new_path
+        else:
+            lines.append(new_path)
+
+    await db.set_setting("equipment_photos_raw", "\n".join(lines))
+    await state.clear()
+
+    if mid is not None and cid is not None:
+        s2 = await db.get_all_settings()
+        await _restore_admin_panel_message(
+            message.bot,
+            int(cid),
+            int(mid),
+            text=_equipment_admin_text(s2),
+            reply_markup=_equipment_menu_kb(s2),
+        )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.message(AdminStates.equipment_photo_wait)
+async def admin_equipment_need_photo(message: Message, config: Config) -> None:
+    if not _is_admin(message.from_user.id, config):
+        return
+    await message.answer(
+        "Пришлите изображение <b>как фото</b> (в сжатом виде). "
+        "Или нажмите «Отмена» под предыдущим сообщением."
+        f"{_EQUIPMENT_PHOTO_SIZE_HINT}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(AdminStates.directions_video_wait, F.video)
+async def admin_directions_got_video(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if not _is_admin(message.from_user.id, config):
+        await state.clear()
+        return
+    data = await state.get_data()
+    fid = message.video.file_id
+    await db.set_setting("studio_directions_video_file_id", fid)
+    await state.clear()
+    mid = data.get("admin_panel_mid")
+    cid = data.get("admin_panel_cid")
+    if mid is not None and cid is not None:
+        s2 = await db.get_all_settings()
+        await _restore_admin_panel_message(
+            message.bot,
+            int(cid),
+            int(mid),
+            text=_studio_nav_admin_text(s2),
+            reply_markup=_studio_nav_menu_kb(s2),
+        )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.message(AdminStates.directions_video_wait)
+async def admin_directions_need_video(message: Message, config: Config) -> None:
+    if not _is_admin(message.from_user.id, config):
+        return
+    await message.answer(
+        "Пришлите видео или нажмите «Отмена».",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(AdminStates.ui_photo_wait, F.photo)
+async def admin_ui_got_photo(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if not _is_admin(message.from_user.id, config):
+        await state.clear()
+        return
+    data = await state.get_data()
+    sk = data.get("ui_photo_setting_key")
+    if not sk:
+        await state.clear()
+        return
+    s = await db.get_all_settings()
+    old = (s.get(sk) or "").strip()
+    if old:
+        _try_delete_ui_upload(old)
+
+    UI_UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    dest = UI_UPLOAD_ROOT / f"ui_{uuid4().hex}.jpg"
+    await message.bot.download(message.photo[-1], destination=dest)
+    new_path = str(dest.resolve())
+    await db.set_setting(sk, new_path)
+    await state.clear()
+    mid = data.get("admin_panel_mid")
+    cid = data.get("admin_panel_cid")
+    if mid is not None and cid is not None:
+        s2 = await db.get_all_settings()
+        await _restore_admin_panel_message(
+            message.bot,
+            int(cid),
+            int(mid),
+            text=_ui_photos_admin_text(s2),
+            reply_markup=_ui_photos_menu_kb(s2),
+        )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+@router.message(AdminStates.ui_photo_wait)
+async def admin_ui_need_photo(message: Message, config: Config) -> None:
+    if not _is_admin(message.from_user.id, config):
+        return
+    await message.answer(
+        "Пришлите изображение как фото или нажмите «Отмена».",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(AdminStates.wait_setting_text)
 async def admin_wait_setting_text(
     message: Message, state: FSMContext, db: Database, config: Config
@@ -767,6 +1302,22 @@ async def admin_wait_setting_text(
         ]
         for fk, val in zip(field_keys, lines[:6]):
             await db.set_setting(fk, val)
+    elif key == "subscription_channel_link":
+        val = "" if raw == "-" else raw
+        await db.set_setting(key, val)
+    elif key in ("subscription_channel_id", "schedule_channel_id", "payments_inbox_chat_id"):
+        if raw == "-":
+            await db.set_setting(key, "")
+        else:
+            try:
+                int(raw)
+            except ValueError:
+                await message.answer(
+                    "Нужно целое число (ID канала или чата) или <code>-</code> для сброса.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await db.set_setting(key, raw.strip())
     else:
         val = "" if raw == "-" else raw
         await db.set_setting(key, val)
@@ -775,7 +1326,26 @@ async def admin_wait_setting_text(
     mid = data.get("admin_panel_mid")
     cid = data.get("admin_panel_cid")
     if mid is not None and cid is not None:
-        await _restore_admin_panel_message(message.bot, int(cid), int(mid))
+        if key == "studio_address_html":
+            s2 = await db.get_all_settings()
+            await _restore_admin_panel_message(
+                message.bot,
+                int(cid),
+                int(mid),
+                text=_studio_nav_admin_text(s2),
+                reply_markup=_studio_nav_menu_kb(s2),
+            )
+        elif key in _CHANNEL_SETTING_KEYS:
+            s2 = await db.get_all_settings()
+            await _restore_admin_panel_message(
+                message.bot,
+                int(cid),
+                int(mid),
+                text=_channels_admin_text(s2, config),
+                reply_markup=_channels_menu_kb(),
+            )
+        else:
+            await _restore_admin_panel_message(message.bot, int(cid), int(mid))
     try:
         await message.delete()
     except Exception:

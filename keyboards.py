@@ -230,10 +230,14 @@ def my_booking_kb(booking_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def my_bookings_kb(booking_ids: list[int]) -> InlineKeyboardMarkup:
+def my_bookings_kb(
+    booking_ids: list[int], *, show_directions: bool = False
+) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for bid in booking_ids:
         kb.button(text=f"❌ Отменить #{bid}", callback_data=f"book:cancel:{bid}")
+    if show_directions:
+        kb.button(text="🗺 Как пройти до студии", callback_data="book:directions")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()

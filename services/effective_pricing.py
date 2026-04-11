@@ -49,6 +49,18 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "tariff_day_8h_engineer": str(cfg.tariff_day_8h_engineer),
         "tariff_day_10h_engineer": str(cfg.tariff_day_10h_engineer),
         "tariff_day_12h_engineer": str(cfg.tariff_day_12h_engineer),
+        "studio_address_html": "",
+        "studio_directions_video_file_id": "",
+        "ui_photo_main_menu_path": "",
+        "ui_photo_prices_path": "",
+        "ui_photo_payment_path": "",
+        "ui_photo_tariff_category_path": "",
+        "ui_photo_tariff_night_path": "",
+        "ui_photo_tariff_day_path": "",
+        "subscription_channel_id": "",
+        "subscription_channel_link": "",
+        "schedule_channel_id": "",
+        "payments_inbox_chat_id": "",
     }
     return d
 
