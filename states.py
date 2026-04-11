@@ -1,0 +1,23 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class BookingStates(StatesGroup):
+    choosing_product = State()
+    choosing_studio_mode = State()
+    choosing_tariff = State()
+    choosing_tariff_date = State()
+    choosing_date = State()
+    choosing_slot = State()
+    entering_brief = State()
+    entering_contacts = State()
+    waiting_payment = State()
+    awaiting_payment_confirm = State()
+
+
+class AdminStates(StatesGroup):
+    action_date = State()
+    slot_time_input = State()
+    cancel_booking_input = State()
+    price_wait_value = State()
+    toggle_slots_pick = State()
+
