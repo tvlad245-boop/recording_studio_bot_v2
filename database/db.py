@@ -127,6 +127,7 @@ class Database:
             await self._migrate_bookings_kind_notes()
             await self._migrate_bookings_tg_username()
             await self._migrate_bookings_requires_engineer()
+            await self._migrate_bookings_client_cleanup()
 
     async def _migrate_bookings_booked_slot_ids(self) -> None:
         async with self.connect() as db:
@@ -167,6 +168,25 @@ class Database:
                 await db.commit()
             except aiosqlite.OperationalError:
                 pass
+
+    async def _migrate_bookings_client_cleanup(self) -> None:
+        """JSON: {\"chat_id\": int, \"root\": int | null, \"extra\": [message_id, ...]} — удалить после подтверждения оплаты."""
+        async with self.connect() as db:
+            self._configure(db)
+            try:
+                await db.execute("ALTER TABLE bookings ADD COLUMN client_cleanup_json TEXT")
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+    async def update_booking_client_cleanup(self, booking_id: int, payload: str | None) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute(
+                "UPDATE bookings SET client_cleanup_json = ? WHERE id = ?",
+                (payload, booking_id),
+            )
+            await db.commit()
 
     async def get_bot_message(self, key: str) -> dict[str, Any] | None:
         async with self.connect() as db:

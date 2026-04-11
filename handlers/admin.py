@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import Config
 from database.db import Database
-from handlers.user import finalize_confirmed_payment
+from handlers.user import delete_booking_pending_ui_messages, finalize_confirmed_payment
 from keyboards import month_calendar_kb, now_month
 from services.effective_pricing import EffectivePricing, load_effective_pricing
 from services.reminders import ReminderService
@@ -637,6 +637,7 @@ async def payment_reject(
     if not b or b.get("status") != "pending_payment":
         await callback.answer("Уже обработано", show_alert=True)
         return
+    await delete_booking_pending_ui_messages(callback.bot, dict(b))
     row = await db.cancel_booking(bid)
     if not row:
         await callback.answer("Ошибка отмены", show_alert=True)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Iterable
+from typing import Any
 from html import escape as html_escape
 
 from aiogram import Bot, Router, F
@@ -200,8 +202,8 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
                 notes = notes[:247] + "..."
             out.append(
                 f"<b>#{o['id']}</b> — {html_escape(str(o.get('services','—')))} — <b>{o.get('total_price',0)} руб</b>\n"
-                f"<b>Клиент:</b> {html_escape(str(o.get('user_name','')))} "
-                f"{html_escape(str(o.get('phone','')))}\n"
+                f"<b>Клиент:</b> {html_escape(str(o.get('user_name','')))}\n"
+                f"<b>Банк:</b> {html_escape(str(o.get('phone','')))}\n"
                 f"<b>Telegram клиента:</b> {html_escape(client_u) if client_u else '—'}\n"
                 f"{html_escape(notes) if notes else '—'}"
             )
@@ -224,6 +226,42 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
     )
 
 
+async def save_booking_pending_ui_cleanup(
+    db: Database, booking_id: int, *, chat_id: int, data: dict[str, Any]
+) -> None:
+    root_mid = data.get("payment_root_message_id")
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "root": int(root_mid) if root_mid is not None else None,
+            "extra": [int(x) for x in (data.get("cleanup_ids") or [])],
+        },
+        ensure_ascii=False,
+    )
+    await db.update_booking_client_cleanup(booking_id, payload)
+
+
+async def delete_booking_pending_ui_messages(bot: Bot, booking: dict[str, Any]) -> None:
+    """Удаляет у клиента экран ожидания и сообщение с контактами (сохранённые при «Я оплатил»)."""
+    raw = booking.get("client_cleanup_json")
+    if not raw:
+        return
+    try:
+        p = json.loads(raw)
+        cid = int(p["chat_id"])
+        mids: list[int] = []
+        if p.get("root") is not None:
+            mids.append(int(p["root"]))
+        mids.extend(int(x) for x in (p.get("extra") or []))
+        for mid in mids:
+            try:
+                await bot.delete_message(cid, mid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 async def finalize_confirmed_payment(
     bot: Bot,
     db: Database,
@@ -235,6 +273,7 @@ async def finalize_confirmed_payment(
     row = await db.confirm_booking_payment(booking_id)
     if not row:
         return False, "Заявка не найдена или уже обработана"
+    await delete_booking_pending_ui_messages(bot, row)
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.schedule_for_booking(row)
@@ -267,14 +306,6 @@ async def finalize_confirmed_payment(
         new_entry_html=entry,
     )
     await _publish_weekly_and_tasks(bot, db, cfg)
-    try:
-        await bot.send_message(
-            uid,
-            "<b>✅ Оплата подтверждена</b>\n\nВаша заявка принята. Спасибо!",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
     return True, "ok"
 
 
@@ -469,6 +500,67 @@ async def _edit_by_message_id(
                 )
             except Exception:
                 pass
+
+
+def _parse_tg_username_line(line: str, fallback: str | None) -> str:
+    s = (line or "").strip()
+    if not s or s in ("—", "-", "–", "нет", "Нет", "нету"):
+        return (fallback or "").strip()
+    return s.lstrip("@").strip()
+
+
+async def _present_main_menu_on_message(
+    bot,
+    *,
+    chat_id: int,
+    message_id: int,
+    config: Config,
+) -> None:
+    """Главное меню с картинкой MAIN_MENU_PHOTO_PATH (как после /start), в т.ч. после оплаты или раздела «Оборудование»."""
+    text = "<b>🏠 Главное меню</b>"
+    cap = _truncate_html(text, 1024)
+    main_photo = _file(config.main_menu_photo_path)
+    if main_photo:
+        try:
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=InputMediaPhoto(media=main_photo, caption=cap, parse_mode=ParseMode.HTML),
+                reply_markup=main_menu_kb(),
+            )
+            return
+        except TelegramBadRequest:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=main_photo,
+                caption=cap,
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_kb(),
+            )
+            return
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_truncate_html(text, 4096),
+            reply_markup=main_menu_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=cap,
+                reply_markup=main_menu_kb(),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramBadRequest:
+            pass
 
 
 def _slots_caption(day: str, n_selected: int) -> str:
@@ -674,6 +766,7 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config) 
     prompt_id = data.get("brief_prompt_message_id")
     root_id = data.get("payment_root_message_id") or data.get("brief_root_message_id")
     chat_id = callback.message.chat.id
+    target_mid = int(root_id) if root_id else int(callback.message.message_id)
 
     if prompt_id:
         try:
@@ -683,16 +776,12 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config) 
 
     await state.clear()
 
-    if root_id:
-        await _edit_by_message_id(
-            callback.bot,
-            chat_id,
-            root_id,
-            "<b>🏠 Главное меню</b>",
-            reply_markup=main_menu_kb(),
-        )
-    else:
-        await _edit(callback.message, "<b>🏠 Главное меню</b>", reply_markup=main_menu_kb())
+    await _present_main_menu_on_message(
+        callback.bot,
+        chat_id=chat_id,
+        message_id=target_mid,
+        config=config,
+    )
     await callback.answer()
 
 
@@ -847,10 +936,13 @@ async def pick_product(
         pass
     screen = (
         "<b>📝 Опишите заказ</b>\n\n"
-        "Отправьте одним сообщением 3 строки:\n"
-        "1) Пожелания\n"
-        "2) Имя\n"
-        "3) Телефон\n\n"
+        "Отправьте <b>несколько строк</b> в таком порядке:\n"
+        "• сначала — <b>пожелания</b> к заказу (можно несколько строк);\n"
+        "• затем <b>4 отдельные строки</b>:\n"
+        "  — имя\n"
+        "  — фамилия\n"
+        "  — банк (с какого будет оплата)\n"
+        "  — ваш @username в Telegram (или «—» если без username)\n\n"
         f"<b>Стоимость:</b> {price} руб"
     )
     sent_id, is_photo = await _send_payment_screen_message(
@@ -1242,9 +1334,16 @@ async def pick_tariff_date(
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
         f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
-        "<b>Далее отправьте одним сообщением:</b>\n"
-        "Имя и номер телефона\n"
-        "<i>Пример: Иван +79991234567</i>"
+        "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
+        "• имя\n"
+        "• фамилия\n"
+        "• банк (с какого будет оплата)\n"
+        "• ваш @username в Telegram (или «—»)\n\n"
+        "<i>Пример:\n"
+        "Иван\n"
+        "Иванов\n"
+        "Сбербанк\n"
+        "@nickname</i>"
     )
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
@@ -1389,9 +1488,16 @@ async def slot_confirm(
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
         f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
-        "<b>Далее отправьте одним сообщением:</b>\n"
-        "Имя и номер телефона\n"
-        "<i>Пример: Иван +79991234567</i>"
+        "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
+        "• имя\n"
+        "• фамилия\n"
+        "• банк (с какого будет оплата)\n"
+        "• ваш @username в Telegram (или «—»)\n\n"
+        "<i>Пример:\n"
+        "Иван\n"
+        "Иванов\n"
+        "Сбербанк\n"
+        "@nickname</i>"
     )
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
@@ -1416,28 +1522,40 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
         return
 
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    if len(lines) < 3:
+    if len(lines) < 5:
         await message.answer(
-            "Нужно 3 строки:\n"
-            "1) Пожелания\n"
-            "2) Имя\n"
-            "3) Телефон\n\n"
+            "Нужно минимум 5 строк: пожелания (можно несколько строк), затем имя, фамилию, банк и @username "
+            "(или «—»).\n\n"
             "Пример:\n"
-            "Хочу поп, женский вокал...\n"
+            "Хочу поп, женский вокал, минор...\n"
             "Иван\n"
-            "+79991234567"
+            "Иванов\n"
+            "Сбербанк\n"
+            "@nickname"
         )
         return
 
-    phone = lines[-1]
-    name = lines[-2]
-    brief = "\n".join(lines[:-2]).strip()
-    if len(brief) < 10 or len(name) < 2 or len(phone) < 6:
-        await message.answer("Проверьте формат: пожелания (>=10 символов), имя, телефон.")
+    first_name = lines[-4]
+    last_name = lines[-3]
+    bank = lines[-2]
+    tg_line = lines[-1]
+    brief = "\n".join(lines[:-4]).strip()
+    user_display_name = f"{first_name} {last_name}".strip()
+    tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+    if len(brief) < 10 or len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
+        await message.answer(
+            "Проверьте: пожелания (от 10 символов), имя, фамилию, банк (от 2 символов), username."
+        )
         return
 
     price = pricing.service_price(product)
-    await state.update_data(brief=brief, total=price, name=name, phone=phone, tg_username=message.from_user.username or "")
+    await state.update_data(
+        brief=brief,
+        total=price,
+        name=user_display_name,
+        phone=bank,
+        tg_username=tg_u,
+    )
     await state.set_state(BookingStates.waiting_payment)
     root_mid = data.get("payment_root_message_id")
     is_photo = data.get("payment_root_is_photo", False)
@@ -1492,17 +1610,29 @@ async def enter_brief(message: Message, state: FSMContext, config: Config, prici
 
 @router.message(BookingStates.entering_contacts)
 async def enter_contacts(message: Message, state: FSMContext, config: Config, pricing: EffectivePricing) -> None:
-    raw = (message.text or "").strip().replace("\n", " ")
-    parts = raw.split()
-    if len(parts) < 2:
-        await message.answer("Формат: Имя +79991234567")
+    raw = (message.text or "").strip()
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if len(lines) < 4:
+        await message.answer(
+            "Нужно ровно 4 строки:\n"
+            "• имя\n"
+            "• фамилия\n"
+            "• банк (с какого будет оплата)\n"
+            "• @username в Telegram (или «—»)\n\n"
+            "Пример:\n"
+            "Иван\n"
+            "Иванов\n"
+            "Сбербанк\n"
+            "@nickname"
+        )
         return
-    phone = parts[-1]
-    name = " ".join(parts[:-1]).strip()
-    if len(name) < 2:
-        await message.answer("Имя слишком короткое. Формат: Имя +79991234567")
+    first_name, last_name, bank, tg_line = lines[0], lines[1], lines[2], lines[3]
+    user_name = f"{first_name} {last_name}".strip()
+    tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+    if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
+        await message.answer("Проверьте имя, фамилию и название банка (минимум 2 символа).")
         return
-    await state.update_data(name=name, phone=phone, tg_username=message.from_user.username or "")
+    await state.update_data(name=user_name, phone=bank, tg_username=tg_u)
     await state.set_state(BookingStates.waiting_payment)
 
     data = await state.get_data()
@@ -1516,6 +1646,7 @@ async def enter_contacts(message: Message, state: FSMContext, config: Config, pr
     slot_ids = data.get("slot_ids") or []
     hours = len(slot_ids)
     svc_line = html_escape(str(data.get("tariff_label") or pricing.service_title(product)))
+    tg_disp = f"@{html_escape(tg_u)}" if tg_u else "—"
     screen2 = (
         "<b>💳 Реквизиты для оплаты</b>\n\n"
         f"<b>Услуга:</b> {svc_line}\n"
@@ -1524,7 +1655,9 @@ async def enter_contacts(message: Message, state: FSMContext, config: Config, pr
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
         f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
-        f"<b>Контакты:</b> {html_escape(name)} {html_escape(phone)}\n\n"
+        f"<b>Данные:</b> {html_escape(user_name)}\n"
+        f"<b>Банк:</b> {html_escape(bank)}\n"
+        f"<b>Telegram:</b> {tg_disp}\n\n"
         "После оплаты нажмите кнопку ниже."
     )
     root_mid = data.get("payment_root_message_id")
@@ -1627,6 +1760,7 @@ async def paid(
             status="pending_payment",
         )
         booking = await db.get_booking_by_id(order_id)
+        await save_booking_pending_ui_cleanup(db, order_id, chat_id=chat_id, data=data)
         client_tg = _format_tg_username(data.get("tg_username") or callback.from_user.username or "")
         maker = config.textmaker_username if product == "lyrics" else config.beatmaker_username
         admin_text = (
@@ -1634,8 +1768,8 @@ async def paid(
             f"<b>ID заявки:</b> <code>#{order_id}</code>\n"
             f"<b>Время заявки:</b> {html_escape(str(booking.get('created_at', '—')))}\n"
             f"<b>Услуга:</b> {html_escape(svc_title)}\n"
-            f"<b>Клиент:</b> {html_escape(str(data.get('name', '')))} "
-            f"{html_escape(str(data.get('phone', '')))}\n"
+            f"<b>Клиент:</b> {html_escape(str(data.get('name', '')))}\n"
+            f"<b>Банк:</b> {html_escape(str(data.get('phone', '')))}\n"
             f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
             f"<b>Сумма:</b> {data.get('total', 0)} руб\n"
             f"<b>Исполнитель (.env):</b> {html_escape(_format_maker_username(maker))}\n\n"
@@ -1681,13 +1815,14 @@ async def paid(
         return
 
     booking = await db.get_booking_by_id(booking_id)
+    await save_booking_pending_ui_cleanup(db, booking_id, chat_id=chat_id, data=data)
     client_tg = _format_tg_username(booking.get("tg_username"))
     admin_text = (
         "<b>💳 Подтверждение оплаты</b> <i>(студия)</i>\n\n"
         f"<b>ID заявки:</b> <code>#{booking_id}</code>\n"
         f"<b>Время заявки:</b> {html_escape(str(booking.get('created_at', '—')))}\n"
-        f"<b>Клиент:</b> {html_escape(str(booking['user_name']))} "
-        f"{html_escape(str(booking['phone']))}\n"
+        f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+        f"<b>Банк:</b> {html_escape(str(booking['phone']))}\n"
         f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
         f"<b>Дата:</b> {html_escape(str(booking['day']))}\n"
         f"<b>Время:</b> {html_escape(str(booking['start_time']))} — "
@@ -1757,7 +1892,7 @@ def _format_my_bookings_screen(rows: list[dict], config: Config) -> str:
             lines.append(f"<b>Исполнитель:</b> {html_escape(_format_maker_username(maker))}")
             lines.append(
                 f"<b>Имя:</b> {html_escape(str(b.get('user_name', '—')))}  |  "
-                f"<b>Телефон:</b> {html_escape(str(b.get('phone', '—')))}"
+                f"<b>Банк:</b> {html_escape(str(b.get('phone', '—')))}"
             )
             tu = _format_tg_username(b.get("tg_username"))
             if tu:
@@ -1775,7 +1910,7 @@ def _format_my_bookings_screen(rows: list[dict], config: Config) -> str:
             )
             lines.append(
                 f"<b>Имя:</b> {html_escape(str(b.get('user_name', '—')))}  |  "
-                f"<b>Телефон:</b> {html_escape(str(b.get('phone', '—')))}"
+                f"<b>Банк:</b> {html_escape(str(b.get('phone', '—')))}"
             )
             tu = _format_tg_username(b.get("tg_username"))
             if tu:
