@@ -63,8 +63,10 @@ def tariff_hours_kb(
 
 def booking_products_kb(*, pricing: EffectivePricing) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎤 Запись без звукорежиссёра", callback_data="prod:no_engineer")
-    kb.button(text="🎛️ Запись с звукорежиссёром", callback_data="prod:with_engineer")
+    if pricing.service_no_engineer_enabled:
+        kb.button(text="🎤 Запись без звукорежиссёра", callback_data="prod:no_engineer")
+    if pricing.service_with_engineer_enabled:
+        kb.button(text="🎛️ Запись с звукорежиссёром", callback_data="prod:with_engineer")
     if pricing.service_lyrics_enabled:
         kb.button(text="📝 Текст для песни", callback_data="prod:lyrics")
     if pricing.service_beat_enabled:

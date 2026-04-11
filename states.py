@@ -20,4 +20,5 @@ class AdminStates(StatesGroup):
     cancel_booking_input = State()
     price_wait_value = State()
     toggle_slots_pick = State()
+    wait_setting_text = State()
 

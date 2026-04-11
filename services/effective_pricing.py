@@ -31,6 +31,8 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "price_beat": str(SERVICES["beat"][1]),
         "service_lyrics_enabled": "1",
         "service_beat_enabled": "1",
+        "service_no_engineer_enabled": "1",
+        "service_with_engineer_enabled": "1",
         "tariff_night_6h": str(cfg.tariff_night_6h),
         "tariff_night_8h": str(cfg.tariff_night_8h),
         "tariff_night_10h": str(cfg.tariff_night_10h),
@@ -59,6 +61,8 @@ class EffectivePricing:
     price_beat: int
     service_lyrics_enabled: bool
     service_beat_enabled: bool
+    service_no_engineer_enabled: bool
+    service_with_engineer_enabled: bool
     tariff_night_6h: int
     tariff_night_8h: int
     tariff_night_10h: int
@@ -138,6 +142,8 @@ async def load_effective_pricing(db: Database, cfg: Config) -> EffectivePricing:
         price_beat=_gi(s, "price_beat", SERVICES["beat"][1]),
         service_lyrics_enabled=_gb(s, "service_lyrics_enabled", True),
         service_beat_enabled=_gb(s, "service_beat_enabled", True),
+        service_no_engineer_enabled=_gb(s, "service_no_engineer_enabled", True),
+        service_with_engineer_enabled=_gb(s, "service_with_engineer_enabled", True),
         tariff_night_6h=_gi(s, "tariff_night_6h", cfg.tariff_night_6h),
         tariff_night_8h=_gi(s, "tariff_night_8h", cfg.tariff_night_8h),
         tariff_night_10h=_gi(s, "tariff_night_10h", cfg.tariff_night_10h),

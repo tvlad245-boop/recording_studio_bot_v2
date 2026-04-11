@@ -17,6 +17,7 @@ from config import Config
 from database.db import Database
 from handlers.user import delete_booking_pending_ui_messages, finalize_confirmed_payment
 from keyboards import month_calendar_kb, now_month
+from services.content_settings import setting_bool
 from services.effective_pricing import EffectivePricing, load_effective_pricing
 from services.reminders import ReminderService
 from states import AdminStates
@@ -76,6 +77,61 @@ async def _restore_admin_panel_message(
         pass
 
 
+def _admin_services_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    ne = "✅ Без звукаря" if pricing.service_no_engineer_enabled else "⛔ Без звукаря"
+    we = "✅ Со звукарём" if pricing.service_with_engineer_enabled else "⛔ Со звукарём"
+    ly = "✅ Текст" if pricing.service_lyrics_enabled else "⛔ Текст"
+    bt = "✅ Бит" if pricing.service_beat_enabled else "⛔ Бит"
+    kb.button(text=ne, callback_data="admsvc:no_engineer")
+    kb.button(text=we, callback_data="admsvc:with_engineer")
+    kb.button(text=ly, callback_data="admsvc:lyrics")
+    kb.button(text=bt, callback_data="admsvc:beat")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def _equipment_admin_text(settings: dict[str, str]) -> str:
+    custom = setting_bool(settings, "equipment_use_custom", False)
+    mode = (
+        "Сейчас: <b>свой шаблон (HTML)</b> — базовый макет не используется."
+        if custom
+        else "Сейчас: <b>стандартный шаблон</b> — поля из настроек или .env."
+    )
+    return (
+        "<b>📸 Оборудование и фото студии</b>\n\n"
+        f"{mode}\n\n"
+        "• <b>Свой HTML</b> — весь текст экрана.\n"
+        "• <b>6 строк</b> — заголовок, описание, микрофон, аудиокарта, наушники, мониторы.\n"
+        "• <b>Пути к фото</b> — абсолютные пути Windows/Linux, по одному в строке; пусто — из .env."
+    )
+
+
+def _equipment_menu_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    custom_on = setting_bool(settings, "equipment_use_custom", False)
+    kb.button(
+        text=("⛔ Выключить свой шаблон" if custom_on else "✅ Включить свой шаблон"),
+        callback_data="admeq:toggle_custom",
+    )
+    kb.button(text="✏️ Свой HTML", callback_data="admeq:edit_custom")
+    kb.button(text="✏️ Стандарт — 6 строк", callback_data="admeq:edit_std")
+    kb.button(text="🖼 Пути к фото", callback_data="admeq:edit_photos")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _postpay_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Заказ текста песни", callback_data="admpay:lyrics")
+    kb.button(text="🎚 Заказ бита", callback_data="admpay:beat")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(
@@ -123,6 +179,8 @@ def admin_menu_kb():
     kb.button(text="📋 Расписание на дату", callback_data="admin:schedule")
     kb.button(text="💰 Цены и тарифы", callback_data="admin:prices")
     kb.button(text="🛒 Услуги вкл/выкл", callback_data="admin:services")
+    kb.button(text="📸 Оборудование и фото", callback_data="admin:equipment")
+    kb.button(text="📣 Текст после оплаты (текст/бит)", callback_data="admin:postpay")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -186,17 +244,34 @@ async def admin_actions(
 
     if action == "services":
         await state.clear()
-        ly = "✅ Текст вкл" if pricing.service_lyrics_enabled else "⛔ Текст выкл"
-        bt = "✅ Бит вкл" if pricing.service_beat_enabled else "⛔ Бит выкл"
-        kb = InlineKeyboardBuilder()
-        kb.button(text=ly, callback_data="admsvc:lyrics")
-        kb.button(text=bt, callback_data="admsvc:beat")
-        kb.button(text="⬅ Админ-панель", callback_data="admin:home")
-        kb.adjust(1)
         await _admin_edit_panel(
             callback,
-            "<b>🛒 Услуги</b>\nНажмите, чтобы переключить доступность заказа текста/бита.",
-            kb.as_markup(),
+            "<b>🛒 Услуги</b>\n"
+            "Переключите доступность: запись без/со звукорежиссёром, текст и бит.",
+            _admin_services_kb(pricing),
+        )
+        await callback.answer()
+        return
+
+    if action == "equipment":
+        await state.clear()
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback,
+            _equipment_admin_text(s),
+            _equipment_menu_kb(s),
+        )
+        await callback.answer()
+        return
+
+    if action == "postpay":
+        await state.clear()
+        await _admin_edit_panel(
+            callback,
+            "<b>📣 Текст после оплаты</b>\n\n"
+            "Что видит клиент в сводке после подтверждения оплаты (заказ текста или бита). "
+            "Можно HTML. Пустое значение — контакт из .env (TEXTMAKER_USERNAME / BEATMAKER_USERNAME).",
+            _postpay_menu_kb(),
         )
         await callback.answer()
         return
@@ -543,22 +618,168 @@ async def admin_service_flip(
     elif kind == "beat":
         cur = settings.get("service_beat_enabled", "1") == "1"
         await db.set_setting("service_beat_enabled", "0" if cur else "1")
+    elif kind == "no_engineer":
+        cur = settings.get("service_no_engineer_enabled", "1") == "1"
+        await db.set_setting("service_no_engineer_enabled", "0" if cur else "1")
+    elif kind == "with_engineer":
+        cur = settings.get("service_with_engineer_enabled", "1") == "1"
+        await db.set_setting("service_with_engineer_enabled", "0" if cur else "1")
     else:
         await callback.answer()
         return
     pricing2 = await load_effective_pricing(db, config)
-    ly = "✅ Текст вкл" if pricing2.service_lyrics_enabled else "⛔ Текст выкл"
-    bt = "✅ Бит вкл" if pricing2.service_beat_enabled else "⛔ Бит выкл"
-    kb = InlineKeyboardBuilder()
-    kb.button(text=ly, callback_data="admsvc:lyrics")
-    kb.button(text=bt, callback_data="admsvc:beat")
-    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
-    kb.adjust(1)
     try:
-        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+        await callback.message.edit_reply_markup(reply_markup=_admin_services_kb(pricing2))
     except Exception:
         pass
     await callback.answer("Переключено")
+
+
+@router.callback_query(F.data.startswith("admeq:"))
+async def admin_equipment_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sub = callback.data.split(":")[1]
+    if sub == "toggle_custom":
+        s = await db.get_all_settings()
+        cur = setting_bool(s, "equipment_use_custom", False)
+        await db.set_setting("equipment_use_custom", "0" if cur else "1")
+        s2 = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback, _equipment_admin_text(s2), _equipment_menu_kb(s2)
+        )
+        await callback.answer("Готово")
+        return
+    if sub == "edit_custom":
+        await state.set_state(AdminStates.wait_setting_text)
+        await state.update_data(
+            setting_key="equipment_custom_html",
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Свой HTML</b>\n\nОтправьте одним сообщением весь текст раздела (поддерживается HTML). "
+            "Один символ <code>-</code> — очистить свой шаблон.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    if sub == "edit_std":
+        await state.set_state(AdminStates.wait_setting_text)
+        await state.update_data(
+            setting_key="__equipment_std__",
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Стандартный шаблон</b>\n\n"
+            "Ровно <b>6 строк</b>:\n"
+            "1) Заголовок (без эмодзи 📸)\n"
+            "2) Описание\n"
+            "3) Микрофон\n"
+            "4) Аудиокарта\n"
+            "5) Наушники\n"
+            "6) Мониторы",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    if sub == "edit_photos":
+        await state.set_state(AdminStates.wait_setting_text)
+        await state.update_data(
+            setting_key="equipment_photos_raw",
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        await callback.message.edit_text(
+            "<b>Пути к фото</b>\n\n"
+            "По одному абсолютному пути на строку. Файлы должны быть на диске у бота.\n"
+            "Один символ <code>-</code> — сбросить и брать список из .env.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_abort_kb(),
+        )
+        await callback.answer()
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admpay:"))
+async def admin_postpay_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    kind = callback.data.split(":")[1]
+    key = "postpay_lyrics_html" if kind == "lyrics" else "postpay_beat_html"
+    label = "текста песни" if kind == "lyrics" else "бита"
+    await state.set_state(AdminStates.wait_setting_text)
+    await state.update_data(
+        setting_key=key,
+        admin_panel_mid=callback.message.message_id,
+        admin_panel_cid=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"<b>Текст после оплаты</b> ({label})\n\n"
+        "Что увидит клиент в сводке. Можно HTML. "
+        "Один символ <code>-</code> — сбросить и использовать .env.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_abort_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.wait_setting_text)
+async def admin_wait_setting_text(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if not _is_admin(message.from_user.id, config):
+        await state.clear()
+        return
+    data = await state.get_data()
+    key = data.get("setting_key")
+    if not key:
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if key == "__equipment_std__":
+        if raw == "-":
+            await message.answer("Нужно 6 строк или отмена.")
+            return
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if len(lines) < 6:
+            await message.answer(
+                "Нужно минимум 6 непустых строк: заголовок, описание, микрофон, карта, наушники, мониторы."
+            )
+            return
+        field_keys = [
+            "equipment_title",
+            "equipment_body",
+            "equipment_mic",
+            "equipment_audiocard",
+            "equipment_headphones",
+            "equipment_monitors",
+        ]
+        for fk, val in zip(field_keys, lines[:6]):
+            await db.set_setting(fk, val)
+    else:
+        val = "" if raw == "-" else raw
+        await db.set_setting(key, val)
+
+    await state.clear()
+    mid = data.get("admin_panel_mid")
+    cid = data.get("admin_panel_cid")
+    if mid is not None and cid is not None:
+        await _restore_admin_panel_message(message.bot, int(cid), int(mid))
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("admst:"), AdminStates.toggle_slots_pick)

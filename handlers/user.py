@@ -23,6 +23,12 @@ from aiogram.types import (
 
 from config import Config, payments_inbox_chat_id
 from database.db import Database
+from services.content_settings import (
+    equipment_caption_html,
+    equipment_photo_paths,
+    format_maker_username as _format_maker_username,
+    post_payment_contact_block_html,
+)
 from keyboards import (
     back_to_menu_kb,
     booking_products_kb,
@@ -98,13 +104,6 @@ def _format_tg_username(u: str | None) -> str:
     u = (u or "").strip()
     if not u:
         return ""
-    return u if u.startswith("@") else f"@{u}"
-
-
-def _format_maker_username(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
-        return "—"
     return u if u.startswith("@") else f"@{u}"
 
 
@@ -280,13 +279,12 @@ async def finalize_confirmed_payment(
     uid = int(row["user_id"])
     chat_id = uid
     if kind in ("lyrics", "beat"):
-        maker = cfg.textmaker_username if kind == "lyrics" else cfg.beatmaker_username
+        contact_html = await post_payment_contact_block_html(db, cfg, kind=kind)
         entry = (
             f"<b>Заявка #{booking_id}</b>\n"
             f"{html_escape(str(row.get('services', '—')))}\n"
             f"<b>Сумма:</b> {row.get('total_price', 0)} руб\n"
-            f"<b>Исполнитель:</b> {html_escape(_format_maker_username(maker))}\n"
-            "Мы свяжемся с вами."
+            f"{contact_html}"
         )
     else:
         entry = (
@@ -515,9 +513,13 @@ async def _present_main_menu_on_message(
     chat_id: int,
     message_id: int,
     config: Config,
+    extra_top_html: str | None = None,
 ) -> None:
     """Главное меню с картинкой MAIN_MENU_PHOTO_PATH (как после /start), в т.ч. после оплаты или раздела «Оборудование»."""
-    text = "<b>🏠 Главное меню</b>"
+    if extra_top_html:
+        text = f"{extra_top_html}\n\n<b>🏠 Главное меню</b>"
+    else:
+        text = "<b>🏠 Главное меню</b>"
     cap = _truncate_html(text, 1024)
     main_photo = _file(config.main_menu_photo_path)
     if main_photo:
@@ -602,17 +604,6 @@ def _prices_text(cfg: Config, pricing: EffectivePricing) -> str:
         "<b>Услуги</b>\n"
         f"📝 Текст для вашей песни — <b>{ly} руб</b>\n"
         f"🎚️ Бит для песни — <b>{bt} руб</b>"
-    )
-
-
-def _equipment_caption(cfg: Config) -> str:
-    return (
-        f"<b>📸 {cfg.equipment_title}</b>\n\n"
-        f"{cfg.equipment_text}\n\n"
-        f"🎙️ Микрофон: {cfg.microphone_name}\n"
-        f"🎛️ Аудиокарта: {cfg.audiocard_name}\n"
-        f"🎧 Наушники: {cfg.headphones_name}\n"
-        f"🖥️ Мониторы: {cfg.monitors_name}\n"
     )
 
 
@@ -811,9 +802,11 @@ async def menu_prices(callback: CallbackQuery, config: Config, pricing: Effectiv
 
 
 @router.callback_query(F.data == "menu:equipment")
-async def menu_equipment(callback: CallbackQuery, config: Config) -> None:
-    caption = _equipment_caption(config)
-    photos = [p for p in config.equipment_photos if _file(p)]
+async def menu_equipment(callback: CallbackQuery, config: Config, db: Database) -> None:
+    settings = await db.get_all_settings()
+    caption = await equipment_caption_html(db, config)
+    paths = equipment_photo_paths(settings, config)
+    photos = [p for p in paths if _file(p)]
     total = len(photos)
 
     # В одном сообщении можно менять ТОЛЬКО media/подпись. Альбом (media_group) всегда создаёт новые сообщения.
@@ -849,7 +842,7 @@ async def menu_equipment(callback: CallbackQuery, config: Config) -> None:
 
 
 @router.callback_query(F.data.startswith("equip:"))
-async def equipment_nav(callback: CallbackQuery, config: Config) -> None:
+async def equipment_nav(callback: CallbackQuery, config: Config, db: Database) -> None:
     if not getattr(callback.message, "photo", None):
         await callback.answer()
         return
@@ -859,7 +852,9 @@ async def equipment_nav(callback: CallbackQuery, config: Config) -> None:
         await callback.answer()
         return
 
-    photos = [p for p in config.equipment_photos if _file(p)]
+    settings = await db.get_all_settings()
+    paths = equipment_photo_paths(settings, config)
+    photos = [p for p in paths if _file(p)]
     total = len(photos)
     if total == 0:
         await callback.answer("Фото не настроены", show_alert=True)
@@ -870,8 +865,9 @@ async def equipment_nav(callback: CallbackQuery, config: Config) -> None:
         media=InputMediaPhoto(media=photo),
         reply_markup=equipment_carousel_kb(idx, total),
     )
+    cap = await equipment_caption_html(db, config)
     await callback.message.edit_caption(
-        _equipment_caption(config),
+        cap,
         reply_markup=equipment_carousel_kb(idx, total),
         parse_mode=ParseMode.HTML,
     )
@@ -909,6 +905,12 @@ async def pick_product(
         await callback.answer("Услуга временно недоступна.", show_alert=True)
         return
     if code == "beat" and not pricing.service_beat_enabled:
+        await callback.answer("Услуга временно недоступна.", show_alert=True)
+        return
+    if code == "no_engineer" and not pricing.service_no_engineer_enabled:
+        await callback.answer("Услуга временно недоступна.", show_alert=True)
+        return
+    if code == "with_engineer" and not pricing.service_with_engineer_enabled:
         await callback.answer("Услуга временно недоступна.", show_alert=True)
         return
     await state.update_data(product=code)
@@ -960,10 +962,23 @@ async def pick_product(
 
 
 @router.callback_query(F.data == "sub:check")
-async def sub_check(callback: CallbackQuery, state: FSMContext, config: Config, db: Database) -> None:
+async def sub_check(
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
+) -> None:
     if await is_subscribed(callback.bot, config.channel_id, callback.from_user.id):
         data = await state.get_data()
-        if data.get("product") in ("no_engineer", "with_engineer"):
+        prod = data.get("product")
+        if prod == "no_engineer" and not pricing.service_no_engineer_enabled:
+            await callback.answer("Запись без звукорежиссёра сейчас недоступна.", show_alert=True)
+            return
+        if prod == "with_engineer" and not pricing.service_with_engineer_enabled:
+            await callback.answer("Запись со звукорежиссёром сейчас недоступна.", show_alert=True)
+            return
+        if prod in ("no_engineer", "with_engineer"):
             if await db.user_has_active_studio_booking(callback.from_user.id):
                 await callback.answer(
                     "У вас уже есть активная запись на студию. Сначала отмените её в «Моя запись».",
@@ -971,7 +986,7 @@ async def sub_check(callback: CallbackQuery, state: FSMContext, config: Config, 
                 )
                 return
         await callback.answer("Подписка подтверждена", show_alert=True)
-        if data.get("product") in ("no_engineer", "with_engineer"):
+        if prod in ("no_engineer", "with_engineer"):
             await show_studio_mode(callback, state, config)
         else:
             await show_calendar(callback, state, db)
@@ -1950,12 +1965,17 @@ async def cancel_own(callback: CallbackQuery, db: Database, config: Config, remi
     kind = cancelled.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(booking_id)
-    msg = "❌ Заявка отменена."
+    lines = ["<b>❌ Заявка отменена.</b>"]
     if kind in (None, "studio"):
-        msg += " Слот снова доступен."
-    await _edit(callback.message, msg, reply_markup=main_menu_kb())
-    await callback.bot.send_message(config.admin_id, f"Пользователь отменил заявку #{booking_id}.")
-    # Не спамим отдельными сообщениями по дню — всё идёт в редактируемые сообщения недели/задач
+        lines.append("Слот снова доступен.")
+    extra_top = "\n".join(lines)
+    await _present_main_menu_on_message(
+        callback.bot,
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        config=config,
+        extra_top_html=extra_top,
+    )
     await _publish_weekly_and_tasks(callback.bot, db, config)
     await callback.answer("Готово")
 
