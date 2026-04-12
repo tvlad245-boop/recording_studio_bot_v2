@@ -5,13 +5,21 @@ from __future__ import annotations
 from config import Config, payments_inbox_chat_id
 
 
+def _parse_channel_int(raw: str) -> int | None:
+    """ID канала/чата: убираем любые пробелы (часто копируют из Telegram с лишними символами)."""
+    s = "".join((raw or "").strip().split())
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def effective_subscription_channel_id(settings: dict[str, str], cfg: Config) -> int:
-    raw = (settings.get("subscription_channel_id") or "").strip()
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
+    v = _parse_channel_int(settings.get("subscription_channel_id") or "")
+    if v is not None:
+        return v
     return int(cfg.channel_id)
 
 
@@ -23,21 +31,14 @@ def effective_subscription_channel_link(settings: dict[str, str], cfg: Config) -
 
 
 def effective_schedule_channel_id(settings: dict[str, str], cfg: Config) -> int:
-    raw = (settings.get("schedule_channel_id") or "").strip()
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
+    v = _parse_channel_int(settings.get("schedule_channel_id") or "")
+    if v is not None:
+        return v
     return int(cfg.schedule_channel_id)
 
 
 def effective_payments_inbox_chat_id(settings: dict[str, str], cfg: Config) -> int:
-    raw = (settings.get("payments_inbox_chat_id") or "").strip()
-    if raw:
-        try:
-            v = int(raw)
-            return v if v != 0 else int(cfg.admin_id)
-        except ValueError:
-            pass
+    v = _parse_channel_int(settings.get("payments_inbox_chat_id") or "")
+    if v is not None:
+        return v if v != 0 else int(cfg.admin_id)
     return int(payments_inbox_chat_id(cfg))

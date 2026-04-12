@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from calendar import monthrange
 from datetime import date
@@ -29,6 +30,7 @@ from keyboards import month_calendar_kb, now_month
 from services.content_settings import (
     append_manager_contact_html,
     cancel_refund_warning_html,
+    effective_maker_username,
     equipment_photo_paths,
     setting_bool,
 )
@@ -44,6 +46,7 @@ from states import AdminStates
 
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 ADMIN_HOME_HTML = "<b>🛠 Админ-панель</b>"
 
@@ -90,6 +93,25 @@ def _try_delete_ui_upload(path_str: str) -> None:
 
 def _is_admin(user_id: int, config: Config) -> bool:
     return user_id == config.admin_id
+
+
+async def _user_can_mark_service_done(
+    callback: CallbackQuery, db: Database, config: Config, *, kind: str
+) -> bool:
+    """Админ или username совпадает с контактом текстовика/битмейкера из настроек/.env."""
+    if not callback.from_user:
+        return False
+    if _is_admin(callback.from_user.id, config):
+        return True
+    maker_line = (await effective_maker_username(db, config, kind=kind)).strip()
+    u = (callback.from_user.username or "").strip().lstrip("@").lower()
+    if not u:
+        return False
+    for token in re.split(r"[\s,;|]+", maker_line):
+        t = token.strip().lstrip("@").lower()
+        if t and t == u:
+            return True
+    return False
 
 
 def _month_days(year: int, month: int) -> set[str]:
@@ -826,10 +848,13 @@ async def admin_cancel_booking(
     if not booking:
         await message.answer("Активная запись с таким ID не найдена.")
         return
-    await reminder_service.remove_for_booking(booking_id)
     kind = booking.get("booking_kind") or "studio"
     if kind in (None, "studio"):
+        await reminder_service.remove_for_booking(booking_id)
+    try:
         await _publish_weekly_and_tasks(message.bot, db, config)
+    except Exception:
+        pass
     try:
         await remove_booking_from_user_activity(
             message.bot,
@@ -841,7 +866,11 @@ async def admin_cancel_booking(
     except Exception:
         pass
     try:
-        await message.bot.send_message(booking["user_id"], f"Ваша запись #{booking_id} была отменена администратором.")
+        lbl = "заявка" if kind in ("lyrics", "beat") else "запись"
+        await message.bot.send_message(
+            booking["user_id"],
+            f"Ваша {lbl} #{booking_id} была отменена администратором.",
+        )
     except Exception:
         pass
     await state.clear()
@@ -1479,18 +1508,26 @@ async def admin_wait_setting_text(
         if raw == "-":
             await db.set_setting(key, "")
         else:
+            clean = "".join(raw.split())
             try:
-                int(raw)
+                int(clean)
             except ValueError:
                 await message.answer(
                     "Нужно целое число (ID канала или чата) или <code>-</code> для сброса.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            await db.set_setting(key, raw.strip())
+            await db.set_setting(key, clean)
     else:
         val = "" if raw == "-" else raw
         await db.set_setting(key, val)
+
+    if key == "schedule_channel_id":
+        await db.clear_schedule_channel_bot_messages()
+        try:
+            await _publish_weekly_and_tasks(message.bot, db, config)
+        except Exception:
+            pass
 
     await state.clear()
     mid = data.get("admin_panel_mid")
@@ -1623,7 +1660,10 @@ async def payment_reject(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
+    try:
         await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        pass
     pay_reject = (
         "<b>Оплата не подтверждена</b>\n\n"
         "Если вы уже перевели средства, напишите администратору. "
@@ -1659,10 +1699,7 @@ async def channel_task_mark_done(
     db: Database,
     config: Config,
 ) -> None:
-    if not _is_admin(callback.from_user.id, config):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    parts = callback.data.split(":")
+    parts = (callback.data or "").split(":")
     if len(parts) != 3:
         await callback.answer()
         return
@@ -1675,26 +1712,41 @@ async def channel_task_mark_done(
     except ValueError:
         await callback.answer()
         return
-    row = await db.complete_service_order(bid, kind)
-    if not row:
-        await callback.answer("Уже выполнено или не найдено", show_alert=True)
-        return
-    uid = int(row["user_id"])
-    try:
-        await remove_service_order_from_user_activity(
-            callback.bot,
-            db,
-            config,
-            user_id=uid,
-            booking_id=bid,
+
+    if not await _user_can_mark_service_done(callback, db, config, kind=kind):
+        await callback.answer(
+            "Нет доступа. Кнопку может нажать админ или исполнитель (@username как в настройках контакта).",
+            show_alert=True,
         )
-    except Exception:
-        pass
+        return
+
     try:
-        await _publish_weekly_and_tasks(callback.bot, db, config)
+        row = await db.complete_service_order(bid, kind)
+        if not row:
+            await callback.answer(
+                "Заявка не найдена или ещё не в статусе «оплачено» (ожидает подтверждения оплаты).",
+                show_alert=True,
+            )
+            return
+        uid = int(row["user_id"])
+        try:
+            await remove_service_order_from_user_activity(
+                callback.bot,
+                db,
+                config,
+                user_id=uid,
+                booking_id=bid,
+            )
+        except Exception:
+            logger.exception("remove_service_order_from_user_activity failed bid=%s", bid)
+        try:
+            await _publish_weekly_and_tasks(callback.bot, db, config)
+        except Exception:
+            logger.exception("_publish_weekly_and_tasks failed after task_done bid=%s", bid)
+        await callback.answer("Готово")
     except Exception:
-        pass
-    await callback.answer("Готово")
+        logger.exception("task_done handler failed data=%s", callback.data)
+        await callback.answer("Ошибка при обработке. Смотрите логи бота.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("cnc:ok:"))
@@ -1724,7 +1776,10 @@ async def user_cancellation_approve(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
+    try:
         await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        pass
     try:
         await remove_booking_from_user_activity(
             callback.bot,
@@ -1735,7 +1790,10 @@ async def user_cancellation_approve(
         )
     except Exception:
         pass
-    lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
+    if kind in ("lyrics", "beat"):
+        lines = ["<b>Заявка отменена.</b>"]
+    else:
+        lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
     warn = await cancel_refund_warning_html(db, config)
     if Database.booking_time_started(snap, timezone=config.timezone) and warn:
         lines.append(warn)

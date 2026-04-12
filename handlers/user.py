@@ -70,6 +70,7 @@ from keyboards import (
 )
 from services.effective_pricing import EffectivePricing
 from services.reminders import ReminderService
+from services.schedule_channel import publish_schedule_channel_bundle as _publish_weekly_and_tasks
 from services.subscription import is_subscribed
 from states import BookingStates
 
@@ -156,188 +157,6 @@ def _format_tg_username(u: str | None) -> str:
     if not u:
         return ""
     return u if u.startswith("@") else f"@{u}"
-
-
-def _inline_markup_for_edit(reply_markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
-    """
-    При edit_message_text / edit_message_reply_markup значение None часто означает «не трогать клавиатуру».
-    Пустая inline-клавиатура явно снимает старые кнопки (нужно для блока задач в канале).
-    """
-    if reply_markup is not None:
-        return reply_markup
-    return InlineKeyboardMarkup(inline_keyboard=[])
-
-
-async def _upsert_channel_message(
-    bot,
-    db: Database,
-    *,
-    key: str,
-    chat_id: int,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
-    """
-    Одно "закреплённое" сообщение: редактируем, а если не вышло — отправляем новое и запоминаем message_id.
-    """
-    if not chat_id:
-        return
-    text = (text or "").strip()
-    if not text:
-        text = "—"
-    # Ограничение Telegram: 4096 символов для текста
-    if len(text) > 4096:
-        text = text[:4090] + "…"
-    edit_markup = _inline_markup_for_edit(reply_markup)
-    stored = await db.get_bot_message(key)
-    if stored and int(stored.get("chat_id", 0)) == int(chat_id):
-        mid = int(stored.get("message_id", 0))
-        if mid:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=mid,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=edit_markup,
-                )
-                return
-            except TelegramBadRequest as e:
-                err = str(e).lower()
-                if "message is not modified" in err:
-                    try:
-                        await bot.edit_message_reply_markup(
-                            chat_id=chat_id,
-                            message_id=mid,
-                            reply_markup=edit_markup,
-                        )
-                    except Exception:
-                        pass
-                    return
-            except Exception:
-                pass
-    msg = await bot.send_message(
-        chat_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
-    )
-    await db.upsert_bot_message(key, int(chat_id), int(msg.message_id))
-
-
-async def _build_tasks_channel_block(
-    db: Database,
-    cfg: Config,
-    kind: str,
-    title: str,
-) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Текст и кнопки «Выполнено» для блока задач в канале расписания."""
-    orders = await db.get_active_service_orders(kind)
-    maker_u = await effective_maker_username(db, cfg, kind=kind)
-    out = [f"<b>{title}</b>", ""]
-    out.append(f"<b>Исполнитель:</b> {html_escape(_format_maker_username(maker_u))}")
-    out.append("")
-    if not orders:
-        out.append("Нет активных заявок.")
-        return "\n".join(out), None
-    kb = InlineKeyboardBuilder()
-    for o in orders:
-        client_u = _format_tg_username(o.get("tg_username"))
-        notes = (o.get("notes") or "").strip().replace("\n", " ")
-        if len(notes) > 250:
-            notes = notes[:247] + "..."
-        out.append(
-            f"<b>#{o['id']}</b> — {html_escape(str(o.get('services','—')))} — <b>{o.get('total_price',0)} руб</b>\n"
-            f"<b>Клиент:</b> {html_escape(str(o.get('user_name','')))}\n"
-            f"<b>Банк:</b> {html_escape(str(o.get('phone','')))}\n"
-            f"<b>Telegram клиента:</b> {html_escape(client_u) if client_u else '—'}\n"
-            f"{html_escape(notes) if notes else '—'}"
-        )
-        out.append("")
-        kb.button(
-            text=f"✅ #{o['id']}",
-            callback_data=f"task_done:{kind}:{int(o['id'])}",
-        )
-    kb.adjust(2)
-    return "\n".join(out).strip(), kb.as_markup()
-
-
-async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
-    """
-    3 сообщения в канале расписания:
-    - расписание на ближайшие 7 дней
-    - задачи текстовика
-    - задачи битмейкера
-    """
-    s = await db.get_all_settings()
-    sch_id = effective_schedule_channel_id(s, cfg)
-    if not sch_id:
-        return
-    from datetime import date as _d, timedelta as _td
-
-    days = [(_d.today() + _td(days=i)).isoformat() for i in range(7)]
-    lines = ["<b>📅 Расписание (7 дней)</b>", ""]
-    for day in days:
-        schedule = await db.get_day_schedule(day)
-        lines.append(f"<b>{day}</b>")
-        # Табличный вывод в 2 колонки (00-11 и 12-23)
-        left = [r for r in schedule if int(Database.time_sort_key(Database._coerce_cell_str(r["start_time"]))[0]) < 12]
-        right = [r for r in schedule if int(Database.time_sort_key(Database._coerce_cell_str(r["start_time"]))[0]) >= 12]
-        n = max(len(left), len(right))
-        table_lines: list[str] = []
-        for i in range(n):
-            def cell(r: dict | None) -> str:
-                if not r:
-                    return ""
-                st = Database.normalize_time_str(r["start_time"])
-                et = Database.normalize_time_str(r["end_time"])
-                if r["is_active"]:
-                    mark = "🟢"
-                else:
-                    # 🟠 — занято со звукорежиссёром, 🔴 — занято без
-                    mark = "🟠" if int(r.get("requires_engineer") or 0) == 1 else "🔴"
-                return f"{mark} {st}-{et}"
-            l = cell(left[i]) if i < len(left) else ""
-            rr = cell(right[i]) if i < len(right) else ""
-            table_lines.append(f"{l:<12}    {rr}")
-        legend = "<i>🟢 свободно · 🟠 занято (со звукорежиссёром) · 🔴 занято (без звукорежиссёра)</i>"
-        lines.append(legend)
-        lines.append("<pre>" + "\n".join(html_escape(x) for x in table_lines).strip() + "</pre>")
-        lines.append("")
-    week_text = "\n".join(lines).strip()
-    try:
-        await _upsert_channel_message(
-            bot, db, key="schedule_week_7d", chat_id=sch_id, text=week_text
-        )
-    except Exception:
-        pass
-
-    try:
-        lyrics_text, lyrics_markup = await _build_tasks_channel_block(
-            db, cfg, "lyrics", "📝 Задачи текстовика"
-        )
-        await _upsert_channel_message(
-            bot,
-            db,
-            key="tasks_lyrics",
-            chat_id=sch_id,
-            text=lyrics_text,
-            reply_markup=lyrics_markup,
-        )
-    except Exception:
-        pass
-
-    try:
-        beat_text, beat_markup = await _build_tasks_channel_block(
-            db, cfg, "beat", "🎚️ Задачи битмейкера"
-        )
-        await _upsert_channel_message(
-            bot,
-            db,
-            key="tasks_beat",
-            chat_id=sch_id,
-            text=beat_text,
-            reply_markup=beat_markup,
-        )
-    except Exception:
-        pass
 
 
 async def save_booking_pending_ui_cleanup(
@@ -2240,6 +2059,10 @@ async def paid(
                 reply_markup=_payment_review_kb(order_id),
             )
         await _edit_waiting()
+        try:
+            await _publish_weekly_and_tasks(callback.bot, db, config)
+        except Exception:
+            pass
         await state.set_state(BookingStates.awaiting_payment_confirm)
         await state.update_data(paid_processing=False, pending_booking_id=order_id)
         await callback.answer("Заявка отправлена на проверку")
@@ -2295,6 +2118,10 @@ async def paid(
             reply_markup=_payment_review_kb(booking_id),
         )
     await _edit_waiting()
+    try:
+        await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        pass
     await state.set_state(BookingStates.awaiting_payment_confirm)
     await state.update_data(paid_processing=False, pending_booking_id=booking_id)
     await callback.answer("Заявка отправлена на проверку")
@@ -2450,21 +2277,28 @@ async def cancel_prompt(callback: CallbackQuery, db: Database, config: Config) -
     if not booking or booking["user_id"] != callback.from_user.id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
-    if (booking.get("booking_kind") or "studio") != "studio":
-        await callback.answer("Для этой заявки отмена через бота недоступна.", show_alert=True)
-        return
+    kind = booking.get("booking_kind") or "studio"
     st = booking.get("status")
     if st not in ("active", "pending_payment"):
         await callback.answer("Заявка не может быть отменена в этом статусе.", show_alert=True)
         return
-    lines: list[str] = ["<b>Отменить запись?</b>", ""]
-    warn = await cancel_refund_warning_html(db, config)
-    if Database.booking_time_started(booking, timezone=config.timezone) and warn:
-        lines.append(warn)
-        lines.append("")
-    lines.append(
-        "Запрос на отмену будет отправлен оператору — слот останется занятым до подтверждения."
-    )
+    if kind in ("lyrics", "beat"):
+        lines = ["<b>Отменить заявку?</b>", ""]
+        if st == "pending_payment":
+            lines.append(
+                "Оплата ещё не подтверждена оператором. Заявка будет снята сразу, без ожидания ответа."
+            )
+        else:
+            lines.append("Запрос на отмену будет отправлен оператору.")
+    else:
+        lines = ["<b>Отменить запись?</b>", ""]
+        warn = await cancel_refund_warning_html(db, config)
+        if Database.booking_time_started(booking, timezone=config.timezone) and warn:
+            lines.append(warn)
+            lines.append("")
+        lines.append(
+            "Запрос на отмену будет отправлен оператору — слот останется занятым до подтверждения."
+        )
     text = "\n".join(lines)
     try:
         if getattr(callback.message, "photo", None):
@@ -2517,6 +2351,61 @@ async def cancel_request_send(
     if not booking or booking["user_id"] != callback.from_user.id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    bk = booking.get("booking_kind") or "studio"
+    st = booking.get("status")
+
+    if bk in ("lyrics", "beat") and st == "pending_payment":
+        await state.clear()
+        snap = dict(booking)
+        row = await db.cancel_booking(booking_id)
+        if not row:
+            await callback.answer("Не удалось отменить заявку.", show_alert=True)
+            return
+        await delete_booking_pending_ui_messages(callback.bot, snap)
+        try:
+            await _publish_weekly_and_tasks(callback.bot, db, config)
+        except Exception:
+            pass
+        s = await db.get_all_settings()
+        inbox = effective_payments_inbox_chat_id(s, config)
+        client_tg = _format_tg_username(booking.get("tg_username"))
+        note = (
+            "<b>ℹ️ Клиент отменил заявку до подтверждения оплаты</b>\n\n"
+            f"<b>ID:</b> <code>#{booking_id}</code>\n"
+            f"<b>Услуга:</b> {html_escape(str(booking.get('services', '—')))}\n"
+            f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+            f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
+            f"<b>Сумма:</b> {booking['total_price']} руб"
+        )
+        try:
+            await callback.bot.send_message(inbox, note, parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await callback.bot.send_message(
+                    config.admin_id,
+                    note + "\n\n<i>(не удалось отправить в чат заявок)</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        ann = await append_manager_contact_html(
+            db,
+            "<b>Заявка отменена</b>\n\nОплата ещё не была подтверждена.",
+            config,
+        )
+        try:
+            await delete_pending_ui_and_send_main_menu(
+                callback.bot,
+                db,
+                config,
+                booking_snapshot=row,
+                announcement_html=ann,
+            )
+        except Exception:
+            pass
+        await callback.answer("Заявка отменена")
+        return
+
     row = await db.request_user_cancellation(booking_id, callback.from_user.id)
     if not row:
         await callback.answer("Не удалось отправить запрос.", show_alert=True)
@@ -2525,16 +2414,30 @@ async def cancel_request_send(
     s = await db.get_all_settings()
     inbox = effective_payments_inbox_chat_id(s, config)
     client_tg = _format_tg_username(booking.get("tg_username"))
-    admin_text = (
-        "<b>❌ Запрос на отмену записи</b>\n\n"
-        f"<b>ID:</b> <code>#{booking_id}</code>\n"
-        f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
-        f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
-        f"<b>Дата:</b> {html_escape(str(booking['day']))}\n"
-        f"<b>Время:</b> {html_escape(str(booking['start_time']))} — {html_escape(str(booking['end_time']))}\n"
-        f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
-        f"<b>Сумма:</b> {booking['total_price']} руб"
-    )
+    if bk in ("lyrics", "beat"):
+        notes = (booking.get("notes") or "").strip().replace("\n", " ")
+        if len(notes) > 400:
+            notes = notes[:397] + "..."
+        admin_text = (
+            "<b>❌ Запрос на отмену заявки (текст / бит)</b>\n\n"
+            f"<b>ID:</b> <code>#{booking_id}</code>\n"
+            f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+            f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
+            f"<b>Услуга:</b> {html_escape(str(booking['services']))}\n"
+            f"<b>Сумма:</b> {booking['total_price']} руб\n"
+            f"<b>Пожелания:</b> {html_escape(notes or '—')}"
+        )
+    else:
+        admin_text = (
+            "<b>❌ Запрос на отмену записи</b>\n\n"
+            f"<b>ID:</b> <code>#{booking_id}</code>\n"
+            f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+            f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
+            f"<b>Дата:</b> {html_escape(str(booking['day']))}\n"
+            f"<b>Время:</b> {html_escape(str(booking['start_time']))} — {html_escape(str(booking['end_time']))}\n"
+            f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
+            f"<b>Сумма:</b> {booking['total_price']} руб"
+        )
     try:
         await callback.bot.send_message(
             inbox,
@@ -2549,10 +2452,14 @@ async def cancel_request_send(
             parse_mode=ParseMode.HTML,
             reply_markup=_cancellation_review_kb(booking_id),
         )
+    wait_tail = (
+        "Ожидайте решения оператора."
+        if bk in ("lyrics", "beat")
+        else "Ожидайте решения оператора. Слот пока занят."
+    )
     wait = await append_manager_contact_html(
         db,
-        "<b>⏳ Запрос на отмену отправлен</b>\n\n"
-        "Ожидайте решения оператора. Слот пока занят.",
+        "<b>⏳ Запрос на отмену отправлен</b>\n\n" + wait_tail,
         config,
     )
     chat_id = callback.message.chat.id

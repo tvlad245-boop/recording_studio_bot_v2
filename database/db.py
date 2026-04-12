@@ -215,6 +215,20 @@ class Database:
             )
             await db.commit()
 
+    async def delete_bot_message(self, key: str) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("DELETE FROM bot_messages WHERE key = ?", (key,))
+            await db.commit()
+
+    async def clear_schedule_channel_bot_messages(self) -> None:
+        """Сброс привязки к постам в канале (расписание + задачи). Нужен при смене ID канала или «битом» message_id."""
+        async with self.connect() as db:
+            self._configure(db)
+            for k in ("schedule_week_7d", "tasks_lyrics", "tasks_beat"):
+                await db.execute("DELETE FROM bot_messages WHERE key = ?", (k,))
+            await db.commit()
+
     async def get_user_activity_message(self, user_id: int) -> dict[str, Any] | None:
         """Одно «липкое» сообщение пользователя: накопление успешных заявок."""
         async with self.connect() as db:
@@ -274,13 +288,14 @@ class Database:
             await db.commit()
 
     async def get_active_service_orders(self, kind: str) -> list[dict[str, Any]]:
+        """Текст/бит для блока в канале: активные и ожидающие оплаты (до подтверждения админом)."""
         async with self.connect() as db:
             self._configure(db)
             cur = await db.execute(
                 """
                 SELECT *
                 FROM bookings
-                WHERE status = 'active' AND booking_kind = ?
+                WHERE booking_kind = ? AND status IN ('active', 'pending_payment')
                 ORDER BY id DESC
                 """,
                 (kind,),
@@ -289,7 +304,7 @@ class Database:
             return [dict(r) for r in rows]
 
     async def complete_service_order(self, booking_id: int, kind: str) -> dict[str, Any] | None:
-        """Активная заявка текст/бит → completed (исполнитель нажал «Выполнено» в канале)."""
+        """Активная заявка текст/бит → completed (кнопка «Выполнено» в канале)."""
         async with self.connect() as db:
             self._configure(db)
             cur = await db.execute(
@@ -891,7 +906,10 @@ class Database:
                 """
                 SELECT * FROM bookings WHERE id = ? AND user_id = ?
                   AND status IN ('active', 'pending_payment')
-                  AND (booking_kind IS NULL OR booking_kind = 'studio')
+                  AND (
+                    booking_kind IS NULL OR booking_kind = 'studio'
+                    OR booking_kind IN ('lyrics', 'beat')
+                  )
                 """,
                 (booking_id, user_id),
             )
@@ -1289,7 +1307,16 @@ class Database:
     def booking_time_started(booking: dict[str, Any], *, timezone: str) -> bool:
         from zoneinfo import ZoneInfo
 
-        tz = ZoneInfo(timezone)
-        start = Database.booking_start_datetime(booking).replace(tzinfo=tz)
+        kind = booking.get("booking_kind") or "studio"
+        if kind != "studio":
+            return False
+        day_raw = str(booking.get("day") or "").strip()
+        if len(day_raw) != 10 or day_raw == "service":
+            return False
+        try:
+            tz = ZoneInfo(timezone)
+            start = Database.booking_start_datetime(booking).replace(tzinfo=tz)
+        except (ValueError, TypeError):
+            return False
         return datetime.now(tz) >= start
 
