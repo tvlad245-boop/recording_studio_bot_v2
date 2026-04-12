@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from calendar import monthrange
+from datetime import date as dt_date
 from collections.abc import Iterable
 from typing import Any
 from html import escape as html_escape
@@ -156,6 +158,16 @@ def _format_tg_username(u: str | None) -> str:
     return u if u.startswith("@") else f"@{u}"
 
 
+def _inline_markup_for_edit(reply_markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
+    """
+    При edit_message_text / edit_message_reply_markup значение None часто означает «не трогать клавиатуру».
+    Пустая inline-клавиатура явно снимает старые кнопки (нужно для блока задач в канале).
+    """
+    if reply_markup is not None:
+        return reply_markup
+    return InlineKeyboardMarkup(inline_keyboard=[])
+
+
 async def _upsert_channel_message(
     bot,
     db: Database,
@@ -176,6 +188,7 @@ async def _upsert_channel_message(
     # Ограничение Telegram: 4096 символов для текста
     if len(text) > 4096:
         text = text[:4090] + "…"
+    edit_markup = _inline_markup_for_edit(reply_markup)
     stored = await db.get_bot_message(key)
     if stored and int(stored.get("chat_id", 0)) == int(chat_id):
         mid = int(stored.get("message_id", 0))
@@ -186,7 +199,7 @@ async def _upsert_channel_message(
                     message_id=mid,
                     text=text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
+                    reply_markup=edit_markup,
                 )
                 return
             except TelegramBadRequest as e:
@@ -196,7 +209,7 @@ async def _upsert_channel_message(
                         await bot.edit_message_reply_markup(
                             chat_id=chat_id,
                             message_id=mid,
-                            reply_markup=reply_markup,
+                            reply_markup=edit_markup,
                         )
                     except Exception:
                         pass
@@ -288,32 +301,43 @@ async def _publish_weekly_and_tasks(bot, db: Database, cfg: Config) -> None:
         lines.append(legend)
         lines.append("<pre>" + "\n".join(html_escape(x) for x in table_lines).strip() + "</pre>")
         lines.append("")
-    await _upsert_channel_message(
-        bot, db, key="schedule_week_7d", chat_id=sch_id, text="\n".join(lines).strip()
-    )
+    week_text = "\n".join(lines).strip()
+    try:
+        await _upsert_channel_message(
+            bot, db, key="schedule_week_7d", chat_id=sch_id, text=week_text
+        )
+    except Exception:
+        pass
 
-    lyrics_text, lyrics_markup = await _build_tasks_channel_block(
-        db, cfg, "lyrics", "📝 Задачи текстовика"
-    )
-    await _upsert_channel_message(
-        bot,
-        db,
-        key="tasks_lyrics",
-        chat_id=sch_id,
-        text=lyrics_text,
-        reply_markup=lyrics_markup,
-    )
-    beat_text, beat_markup = await _build_tasks_channel_block(
-        db, cfg, "beat", "🎚️ Задачи битмейкера"
-    )
-    await _upsert_channel_message(
-        bot,
-        db,
-        key="tasks_beat",
-        chat_id=sch_id,
-        text=beat_text,
-        reply_markup=beat_markup,
-    )
+    try:
+        lyrics_text, lyrics_markup = await _build_tasks_channel_block(
+            db, cfg, "lyrics", "📝 Задачи текстовика"
+        )
+        await _upsert_channel_message(
+            bot,
+            db,
+            key="tasks_lyrics",
+            chat_id=sch_id,
+            text=lyrics_text,
+            reply_markup=lyrics_markup,
+        )
+    except Exception:
+        pass
+
+    try:
+        beat_text, beat_markup = await _build_tasks_channel_block(
+            db, cfg, "beat", "🎚️ Задачи битмейкера"
+        )
+        await _upsert_channel_message(
+            bot,
+            db,
+            key="tasks_beat",
+            chat_id=sch_id,
+            text=beat_text,
+            reply_markup=beat_markup,
+        )
+    except Exception:
+        pass
 
 
 async def save_booking_pending_ui_cleanup(
@@ -1420,11 +1444,19 @@ async def show_tariff_calendar(
         "<i>После выбора даты блокируется весь указанный отрезок.</i>"
     )
     closed_admin = await db.get_closed_days_in_month(year, month)
+    # Выходные не входят в allowed, но без blocked_days отображались бы обычными числами, а не ❌.
+    _, dim = monthrange(year, month)
+    weekend_blocked: set[str] = set()
+    if block_weekends:
+        for dn in range(1, dim + 1):
+            ddt = dt_date(year, month, dn)
+            if ddt.weekday() >= 5:
+                weekend_blocked.add(ddt.isoformat())
     mk = month_calendar_kb(
         year,
         month,
         allowed_days=allowed,
-        blocked_days=closed_admin,
+        blocked_days=closed_admin | weekend_blocked,
         prefix="tdate",
         nav_prefix="tcal",
     )
