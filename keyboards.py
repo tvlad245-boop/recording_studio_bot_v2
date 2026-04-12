@@ -255,9 +255,11 @@ def services_kb(selected: set[str]) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def paid_kb() -> InlineKeyboardMarkup:
+def paid_kb(*, online: bool = False) -> InlineKeyboardMarkup:
+    """online=True — оплата через ЮKassa (кнопка «Перейти к оплате»)."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Я оплатил", callback_data="book:paid")
+    label = "💳 Перейти к оплате" if online else "✅ Я оплатил"
+    kb.button(text=label, callback_data="book:paid")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()

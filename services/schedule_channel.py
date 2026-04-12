@@ -34,6 +34,11 @@ _TELEGRAM_TEXT_LIMIT = 4096
 _SAFE_LIMIT = 3800
 
 
+def _date_ru(d: date) -> str:
+    """Дата в виде 12.04.2026 (для заголовков дня в канале)."""
+    return d.strftime("%d.%m.%Y")
+
+
 def _format_tg_username(u: str | None) -> str:
     u = (u or "").strip()
     if not u:
@@ -56,16 +61,17 @@ def _slot_cell(r: dict[str, Any] | None) -> str:
 async def _build_week_schedule_for_ndays(db: Database, num_days: int) -> str:
     """Внутренний билдер без рекурсии."""
     num_days = max(1, min(7, num_days))
-    days = [(date.today() + timedelta(days=i)).isoformat() for i in range(num_days)]
+    day_dates = [date.today() + timedelta(days=i) for i in range(num_days)]
     title = (
         "<b>📅 Расписание (7 дней)</b>"
         if num_days == 7
         else f"<b>📅 Расписание ({num_days} дн.)</b>"
     )
     lines: list[str] = [title, ""]
-    for day in days:
-        schedule = await db.get_day_schedule(day)
-        lines.append(f"<b>{day}</b>")
+    for d in day_dates:
+        day_key = d.isoformat()
+        schedule = await db.get_day_schedule(day_key)
+        lines.append(f"<b>{_date_ru(d)}</b>")
         left = [
             r
             for r in schedule
@@ -249,6 +255,53 @@ async def upsert_channel_message(
     await db.upsert_bot_message(key, chat_id, int(msg.message_id))
 
 
+async def reconcile_schedule_channel_bindings(bot: Bot, db: Database, cfg: Config) -> None:
+    """
+    Если сообщения в канале удалены вручную, в БД остаются message_id — правка не сработает.
+    Лёгкая проверка через снятие клавиатуры: если сообщения нет, сбрасываем ключ,
+    чтобы upsert отправил новые посты.
+    """
+    s = await db.get_all_settings()
+    sch_id = effective_schedule_channel_id(s, cfg)
+    if not sch_id:
+        return
+    try:
+        await bot.get_chat(sch_id)
+    except Exception as e:
+        logger.warning("schedule channel: get_chat failed sch_id=%s: %s", sch_id, e)
+        return
+    empty = InlineKeyboardMarkup(inline_keyboard=[])
+    for key in (KEY_WEEK, KEY_LYRICS, KEY_BEAT):
+        row = await db.get_bot_message(key)
+        if not row or int(row.get("chat_id", 0)) != sch_id:
+            continue
+        mid = int(row.get("message_id", 0))
+        if not mid:
+            await db.delete_bot_message(key)
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=sch_id, message_id=mid, reply_markup=empty
+            )
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if any(
+                x in err
+                for x in (
+                    "message to edit not found",
+                    "message not found",
+                    "message_id_invalid",
+                    "message can't be edited",
+                    "bad request: message identifier is not valid",
+                    "message to delete not found",
+                )
+            ):
+                await db.delete_bot_message(key)
+                logger.info("schedule channel: stale binding cleared key=%s", key)
+        except Exception:
+            logger.exception("reconcile_schedule_channel_bindings key=%s", key)
+
+
 async def publish_schedule_channel_bundle(bot: Bot, db: Database, cfg: Config) -> None:
     """
     Три независимых сообщения в канале: неделя, задачи lyrics, задачи beat.
@@ -258,6 +311,11 @@ async def publish_schedule_channel_bundle(bot: Bot, db: Database, cfg: Config) -
     sch_id = effective_schedule_channel_id(s, cfg)
     if not sch_id:
         return
+
+    try:
+        await reconcile_schedule_channel_bindings(bot, db, cfg)
+    except Exception:
+        logger.exception("reconcile_schedule_channel_bindings failed")
 
     # 1) Неделя
     try:

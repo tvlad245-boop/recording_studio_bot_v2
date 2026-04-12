@@ -1,5 +1,14 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Всегда подхватываем .env из папки проекта (рядом с этим файлом).
+# override=True: значения из .env перекрывают уже заданные в системе переменные (часто SECRET_KEY
+# пустой в «Переменные среды» Windows — без override .env не подхватывался бы).
+_env_file = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_file, override=True, encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -57,6 +66,11 @@ class Config:
     tariff_day_8h_engineer: int
     tariff_day_10h_engineer: int
     tariff_day_12h_engineer: int
+
+    # ЮKassa (если заданы SHOP_ID и SECRET_KEY — включается онлайн-оплата вместо перевода на карту)
+    yookassa_shop_id: str
+    yookassa_secret_key: str
+    yookassa_return_url: str
 
 
 def payments_inbox_chat_id(cfg: Config) -> int:
@@ -126,9 +140,9 @@ def _env_first(*keys: str) -> str:
 
 
 def load_config() -> Config:
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = _env_first("BOT_TOKEN", "TELEGRAM_TOKEN")
     if not token:
-        raise ValueError("BOT_TOKEN is not set")
+        raise ValueError("BOT_TOKEN or TELEGRAM_TOKEN must be set")
 
     admin_id = int(os.getenv("ADMIN_ID", "0"))
     payments_chat_id = int(os.getenv("PAYMENTS_CHAT_ID", "0"))
@@ -202,6 +216,13 @@ def load_config() -> Config:
     tariff_day_10h_engineer = _int_env("TARIFF_DAY_10H_ENGINEER", 10 * _base_we)
     tariff_day_12h_engineer = _int_env("TARIFF_DAY_12H_ENGINEER", 12 * _base_we)
 
+    # Сначала YOOKASSA_* — не конфликтует с чужим SECRET_KEY в системе / Django.
+    yookassa_shop_id = _env_first("YOOKASSA_SHOP_ID", "SHOP_ID")
+    yookassa_secret_key = _env_first("YOOKASSA_SECRET_KEY", "SECRET_KEY")
+    yookassa_return_url = (
+        os.getenv("YOOKASSA_RETURN_URL", "").strip() or "https://yookassa.ru"
+    )
+
     return Config(
         bot_token=token,
         admin_id=admin_id,
@@ -243,5 +264,8 @@ def load_config() -> Config:
         tariff_day_8h_engineer=tariff_day_8h_engineer,
         tariff_day_10h_engineer=tariff_day_10h_engineer,
         tariff_day_12h_engineer=tariff_day_12h_engineer,
+        yookassa_shop_id=yookassa_shop_id,
+        yookassa_secret_key=yookassa_secret_key,
+        yookassa_return_url=yookassa_return_url,
     )
 

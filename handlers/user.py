@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from calendar import monthrange
 from datetime import date as dt_date
@@ -72,10 +73,16 @@ from services.effective_pricing import EffectivePricing
 from services.reminders import ReminderService
 from services.schedule_channel import publish_schedule_channel_bundle as _publish_weekly_and_tasks
 from services.subscription import is_subscribed
+from services.yookassa_payments import (
+    create_payment,
+    is_yookassa_configured,
+    payment_destination_block_html,
+)
 from states import BookingStates
 
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 def _truncate_html(text: str, limit: int) -> str:
     """Обрезка HTML-текста под лимит Telegram для обычных сообщений / подписей."""
@@ -599,33 +606,59 @@ def _slots_caption(day: str, n_selected: int) -> str:
 
 
 def _prices_text(cfg: Config, pricing: EffectivePricing) -> str:
-    ne = pricing.price_no_engineer
-    we = pricing.price_with_engineer
-    ly = pricing.price_lyrics
-    bt = pricing.price_beat
-    return (
-        "<b>💳 Прайс студии</b>\n\n"
-        "<b>Почасовая запись</b>\n"
-        f"🎤 1 час без звукорежиссёра — <b>{ne} руб</b>\n"
-        f"🎛️ 1 час с звукорежиссёром — <b>{we} руб</b>\n\n"
-        "<b>Тарифы — без звукорежиссёра</b>\n"
-        "<i>Ночь (с 00:00):</i>\n"
-        f"🌙 6 ч — <b>{pricing.tariff_night_6h} руб</b> · 8 ч — <b>{pricing.tariff_night_8h} руб</b>\n"
-        f"🌙 10 ч — <b>{pricing.tariff_night_10h} руб</b> · 12 ч — <b>{pricing.tariff_night_12h} руб</b>\n"
-        "<i>День (09:00 / 12:00):</i>\n"
-        f"☀️ 6 ч — <b>{pricing.tariff_day_6h} руб</b> · 8 ч — <b>{pricing.tariff_day_8h} руб</b>\n"
-        f"☀️ 10 ч — <b>{pricing.tariff_day_10h} руб</b> · 12 ч — <b>{pricing.tariff_day_12h} руб</b>\n\n"
-        "<b>Тарифы — со звукорежиссёром</b>\n"
-        "<i>Ночь (с 00:00):</i>\n"
-        f"🌙 6 ч — <b>{pricing.tariff_night_6h_engineer} руб</b> · 8 ч — <b>{pricing.tariff_night_8h_engineer} руб</b>\n"
-        f"🌙 10 ч — <b>{pricing.tariff_night_10h_engineer} руб</b> · 12 ч — <b>{pricing.tariff_night_12h_engineer} руб</b>\n"
-        "<i>День (09:00 / 12:00):</i>\n"
-        f"☀️ 6 ч — <b>{pricing.tariff_day_6h_engineer} руб</b> · 8 ч — <b>{pricing.tariff_day_8h_engineer} руб</b>\n"
-        f"☀️ 10 ч — <b>{pricing.tariff_day_10h_engineer} руб</b> · 12 ч — <b>{pricing.tariff_day_12h_engineer} руб</b>\n\n"
-        "<b>Услуги</b>\n"
-        f"📝 Текст для вашей песни — <b>{ly} руб</b>\n"
-        f"🎚️ Бит для песни — <b>{bt} руб</b>"
-    )
+    """Прайс с учётом включённых/выключенных услуг в админке."""
+    parts: list[str] = ["<b>💳 Прайс студии</b>"]
+    has_studio = pricing.service_no_engineer_enabled or pricing.service_with_engineer_enabled
+
+    if has_studio:
+        parts.append("")
+        parts.append("<b>Почасовая запись</b>")
+        if pricing.service_no_engineer_enabled:
+            parts.append(f"🎤 1 час без звукорежиссёра — <b>{pricing.price_no_engineer} руб</b>")
+        if pricing.service_with_engineer_enabled:
+            parts.append(f"🎛️ 1 час с звукорежиссёром — <b>{pricing.price_with_engineer} руб</b>")
+
+    if pricing.service_no_engineer_enabled:
+        parts.extend(
+            [
+                "",
+                "<b>Тарифы — без звукорежиссёра</b>",
+                "<i>Ночь (с 00:00):</i>",
+                f"🌙 6 ч — <b>{pricing.tariff_night_6h} руб</b> · 8 ч — <b>{pricing.tariff_night_8h} руб</b>",
+                f"🌙 10 ч — <b>{pricing.tariff_night_10h} руб</b> · 12 ч — <b>{pricing.tariff_night_12h} руб</b>",
+                "<i>День (09:00 / 12:00):</i>",
+                f"☀️ 6 ч — <b>{pricing.tariff_day_6h} руб</b> · 8 ч — <b>{pricing.tariff_day_8h} руб</b>",
+                f"☀️ 10 ч — <b>{pricing.tariff_day_10h} руб</b> · 12 ч — <b>{pricing.tariff_day_12h} руб</b>",
+            ]
+        )
+
+    if pricing.service_with_engineer_enabled:
+        parts.extend(
+            [
+                "",
+                "<b>Тарифы — со звукорежиссёром</b>",
+                "<i>Ночь (с 00:00):</i>",
+                f"🌙 6 ч — <b>{pricing.tariff_night_6h_engineer} руб</b> · 8 ч — <b>{pricing.tariff_night_8h_engineer} руб</b>",
+                f"🌙 10 ч — <b>{pricing.tariff_night_10h_engineer} руб</b> · 12 ч — <b>{pricing.tariff_night_12h_engineer} руб</b>",
+                "<i>День (09:00 / 12:00):</i>",
+                f"☀️ 6 ч — <b>{pricing.tariff_day_6h_engineer} руб</b> · 8 ч — <b>{pricing.tariff_day_8h_engineer} руб</b>",
+                f"☀️ 10 ч — <b>{pricing.tariff_day_10h_engineer} руб</b> · 12 ч — <b>{pricing.tariff_day_12h_engineer} руб</b>",
+            ]
+        )
+
+    extra: list[str] = []
+    if pricing.service_lyrics_enabled:
+        extra.append(f"📝 Текст для вашей песни — <b>{pricing.price_lyrics} руб</b>")
+    if pricing.service_beat_enabled:
+        extra.append(f"🎚️ Бит для песни — <b>{pricing.price_beat} руб</b>")
+    if extra:
+        parts.extend(["", "<b>Услуги</b>", *extra])
+
+    if not has_studio and not extra:
+        parts.append("")
+        parts.append("<i>Сейчас нет доступных позиций в прайсе — уточните у администратора.</i>")
+
+    return "\n".join(parts).strip()
 
 
 _ACTIVITY_SEP = "\n\n───────────────\n\n"
@@ -1569,7 +1602,7 @@ async def pick_tariff_date(
         await callback.message.delete()
     except Exception:
         pass
-    pay = (config.payment_details or "").strip().replace("\\n", "\n")
+    dest = payment_destination_block_html(config)
     screen1 = (
         "<b>💳 Реквизиты для оплаты</b>\n\n"
         f"<b>Услуга:</b> {html_escape(tariff_label)}\n"
@@ -1577,7 +1610,7 @@ async def pick_tariff_date(
         f"<b>Время:</b> {slot_text}\n"
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
-        f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
+        f"{dest}\n\n"
         "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
         "• имя\n"
         "• фамилия\n"
@@ -1724,7 +1757,7 @@ async def slot_confirm(
     except Exception:
         pass
 
-    pay = (config.payment_details or "").strip().replace("\\n", "\n")
+    dest = payment_destination_block_html(config)
     screen1 = (
         "<b>💳 Реквизиты для оплаты</b>\n\n"
         f"<b>Услуга:</b> {pricing.service_title(product)}\n"
@@ -1732,7 +1765,7 @@ async def slot_confirm(
         f"<b>Время:</b> {slot_text}\n"
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
-        f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
+        f"{dest}\n\n"
         "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
         "• имя\n"
         "• фамилия\n"
@@ -1814,14 +1847,12 @@ async def enter_brief(
     root_mid = data.get("payment_root_message_id")
     is_photo = data.get("payment_root_is_photo", False)
     if root_mid:
-        pay = (config.payment_details or "").strip()
-        # payment_details may contain literal "\n" from .env; turn into real newlines for readability.
-        pay = pay.replace("\\n", "\n")
+        dest = payment_destination_block_html(config)
         pay_screen = (
             "<b>💳 Реквизиты для оплаты</b>\n\n"
             f"<b>Услуга:</b> {pricing.service_title(product)}\n"
             f"<b>Стоимость:</b> {price} руб\n\n"
-            f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
+            f"{dest}\n\n"
             "После оплаты нажмите кнопку ниже."
         )
         cid = message.chat.id
@@ -1834,7 +1865,7 @@ async def enter_brief(
                 chat_id=cid,
                 message_id=mid,
                 text=pay_screen,
-                reply_markup=paid_kb(),
+                reply_markup=paid_kb(online=is_yookassa_configured(config)),
                 is_photo=is_photo,
             )
         except TelegramBadRequest as e:
@@ -1845,7 +1876,7 @@ async def enter_brief(
                     message.bot,
                     chat_id=cid,
                     text=pay_screen,
-                    reply_markup=paid_kb(),
+                    reply_markup=paid_kb(online=is_yookassa_configured(config)),
                     photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1854,7 +1885,7 @@ async def enter_brief(
                 message.bot,
                 chat_id=cid,
                 text=pay_screen,
-                reply_markup=paid_kb(),
+                reply_markup=paid_kb(online=is_yookassa_configured(config)),
                 photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1903,7 +1934,7 @@ async def enter_contacts(
     product = data.get("product")
     if product not in ("no_engineer", "with_engineer"):
         return
-    pay = (config.payment_details or "").strip().replace("\\n", "\n")
+    dest = payment_destination_block_html(config)
     day = data.get("day")
     slot_text = data.get("slot_text")
     total = data.get("total")
@@ -1918,7 +1949,7 @@ async def enter_contacts(
         f"<b>Время:</b> {slot_text}\n"
         f"<b>Часов:</b> {hours}\n"
         f"<b>Итого:</b> {total} руб\n\n"
-        f"<b>Куда отправить:</b>\n{html_escape(pay)}\n\n"
+        f"{dest}\n\n"
         f"<b>Данные:</b> {html_escape(user_name)}\n"
         f"<b>Банк:</b> {html_escape(bank)}\n"
         f"<b>Telegram:</b> {tg_disp}\n\n"
@@ -1936,7 +1967,7 @@ async def enter_contacts(
                 chat_id=cid,
                 message_id=int(root_mid),
                 text=screen2,
-                reply_markup=paid_kb(),
+                reply_markup=paid_kb(online=is_yookassa_configured(config)),
                 is_photo=is_photo,
             )
         except TelegramBadRequest as e:
@@ -1947,7 +1978,7 @@ async def enter_contacts(
                     message.bot,
                     chat_id=cid,
                     text=screen2,
-                    reply_markup=paid_kb(),
+                    reply_markup=paid_kb(online=is_yookassa_configured(config)),
                     photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1956,7 +1987,7 @@ async def enter_contacts(
                 message.bot,
                 chat_id=cid,
                 text=screen2,
-                reply_markup=paid_kb(),
+                reply_markup=paid_kb(online=is_yookassa_configured(config)),
                 photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1988,6 +2019,7 @@ async def paid(
     chat_id = callback.message.chat.id
     root_mid = data.get("payment_root_message_id")
     is_photo = bool(data.get("payment_root_is_photo", False))
+    use_yk = is_yookassa_configured(config)
 
     async def _edit_waiting() -> None:
         waiting = await append_manager_contact_html(
@@ -1995,6 +2027,29 @@ async def paid(
             "<b>⏳ Ожидайте подтверждения</b>\n\n"
             "Мы проверяем оплату. Как только оператор подтвердит заявку, "
             "вы получите уведомление в этот чат.",
+            config,
+        )
+        if root_mid:
+            try:
+                await _edit_payment_screen_message(
+                    callback.bot,
+                    chat_id=chat_id,
+                    message_id=int(root_mid),
+                    text=waiting,
+                    reply_markup=None,
+                    is_photo=is_photo,
+                )
+            except Exception:
+                await callback.bot.send_message(
+                    chat_id, waiting, parse_mode=ParseMode.HTML
+                )
+
+    async def _edit_waiting_yk() -> None:
+        waiting = await append_manager_contact_html(
+            db,
+            "<b>⏳ Ожидайте</b>\n\n"
+            "Перейдите по ссылке ниже и завершите оплату на странице ЮKassa. "
+            "После успешной оплаты заявка подтвердится автоматически.",
             config,
         )
         if root_mid:
@@ -2044,6 +2099,59 @@ async def paid(
             f"<b>Исполнитель:</b> {html_escape(_format_maker_username(maker))}\n\n"
             f"<b>Пожелания:</b>\n{html_escape(str(data.get('brief', '')))}"
         )
+        if use_yk:
+            admin_text += (
+                "\n\n<i>Клиент оплачивает через ЮKassa — после оплаты заявка подтвердится автоматически.</i>"
+            )
+            try:
+                pay_url = create_payment(
+                    int(data.get("total", 0)),
+                    f"{svc_title} #{order_id}",
+                    callback.from_user.id,
+                    {"booking_id": order_id},
+                    config=config,
+                )
+            except Exception:
+                logger.exception("YooKassa create_payment failed order_id=%s", order_id)
+                await db.cancel_booking(order_id)
+                await state.update_data(paid_processing=False)
+                await callback.answer(
+                    "Не удалось создать платёж. Попробуйте позже или напишите администратору.",
+                    show_alert=True,
+                )
+                return
+            try:
+                await callback.bot.send_message(
+                    inbox,
+                    admin_text,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                await callback.bot.send_message(
+                    config.admin_id,
+                    admin_text + "\n\n<i>(не удалось отправить в PAYMENTS_CHAT_ID)</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            await callback.bot.send_message(
+                chat_id,
+                "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)]
+                    ]
+                ),
+            )
+            await _edit_waiting_yk()
+            try:
+                await _publish_weekly_and_tasks(callback.bot, db, config)
+            except Exception:
+                pass
+            await state.set_state(BookingStates.awaiting_payment_confirm)
+            await state.update_data(paid_processing=False, pending_booking_id=order_id)
+            await callback.answer("Откройте ссылку и оплатите")
+            return
+
         try:
             await callback.bot.send_message(
                 inbox,
@@ -2103,6 +2211,59 @@ async def paid(
         f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
         f"<b>Сумма:</b> {booking['total_price']} руб"
     )
+    if use_yk:
+        admin_text += (
+            "\n\n<i>Клиент оплачивает через ЮKassa — после оплаты заявка подтвердится автоматически.</i>"
+        )
+        try:
+            pay_url = create_payment(
+                int(data["total"]),
+                f"Запись на студию #{booking_id}",
+                callback.from_user.id,
+                {"booking_id": booking_id},
+                config=config,
+            )
+        except Exception:
+            logger.exception("YooKassa create_payment failed booking_id=%s", booking_id)
+            await db.cancel_booking(booking_id)
+            await state.update_data(paid_processing=False)
+            await callback.answer(
+                "Не удалось создать платёж. Попробуйте позже или напишите администратору.",
+                show_alert=True,
+            )
+            return
+        try:
+            await callback.bot.send_message(
+                inbox,
+                admin_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback.bot.send_message(
+                config.admin_id,
+                admin_text + "\n\n<i>(не удалось отправить в PAYMENTS_CHAT_ID)</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        await callback.bot.send_message(
+            chat_id,
+            "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)]
+                ]
+            ),
+        )
+        await _edit_waiting_yk()
+        try:
+            await _publish_weekly_and_tasks(callback.bot, db, config)
+        except Exception:
+            pass
+        await state.set_state(BookingStates.awaiting_payment_confirm)
+        await state.update_data(paid_processing=False, pending_booking_id=booking_id)
+        await callback.answer("Откройте ссылку и оплатите")
+        return
+
     try:
         await callback.bot.send_message(
             inbox,

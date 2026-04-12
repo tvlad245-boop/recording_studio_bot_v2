@@ -294,6 +294,10 @@ def _channels_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="📢 ID канала подписки", callback_data="adch:sub_id")
     kb.button(text="🔗 Ссылка «Подписаться»", callback_data="adch:sub_link")
     kb.button(text="📅 Канал расписания", callback_data="adch:schedule")
+    kb.button(
+        text="🔄 Обновить посты расписания",
+        callback_data="adch:republish_schedule",
+    )
     kb.button(text="💳 Чат подтверждений оплаты", callback_data="adch:payments")
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
@@ -1236,6 +1240,23 @@ async def admin_ui_photo_actions(
         reply_markup=_admin_abort_kb(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "adch:republish_schedule")
+async def admin_channels_republish_schedule(
+    callback: CallbackQuery, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        await db.clear_schedule_channel_bot_messages()
+        await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        logger.exception("republish schedule channel failed")
+        await callback.answer("Ошибка публикации — см. логи бота", show_alert=True)
+        return
+    await callback.answer("Посты расписания в канале обновлены")
 
 
 @router.callback_query(F.data.startswith("adch:"))
