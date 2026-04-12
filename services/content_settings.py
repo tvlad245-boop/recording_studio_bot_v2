@@ -110,6 +110,16 @@ async def manager_contact_html(db: Database) -> str:
     return (s.get("manager_contact_html") or "").strip()
 
 
+async def effective_maker_username(db: Database, cfg: Config, *, kind: str) -> str:
+    """Контакт текстовика/битмейкера: из bot_settings, иначе из .env."""
+    s = await db.get_all_settings()
+    key = "textmaker_username" if kind == "lyrics" else "beatmaker_username"
+    raw = (s.get(key) or "").strip()
+    if raw:
+        return raw
+    return cfg.textmaker_username if kind == "lyrics" else cfg.beatmaker_username
+
+
 async def cancel_refund_warning_html(db: Database, cfg: Config | None = None) -> str:
     s = await db.get_all_settings()
     raw = (s.get("cancel_refund_warning_html") or "").strip()
@@ -122,8 +132,10 @@ async def cancel_refund_warning_html(db: Database, cfg: Config | None = None) ->
     return ""
 
 
-async def append_manager_contact_html(db: Database, text: str) -> str:
+async def append_manager_contact_html(db: Database, text: str, cfg: Config | None = None) -> str:
     m = await manager_contact_html(db)
+    if not m and cfg is not None:
+        m = "<i>По вопросам оплаты напишите администратору в ответ на это сообщение.</i>"
     if not m:
         return text
     return f"{text}\n\n{m}"
@@ -135,7 +147,7 @@ async def post_payment_contact_block_html(db: Database, cfg: Config, *, kind: st
     custom = (s.get(key) or "").strip()
     if custom:
         return custom
-    maker = cfg.textmaker_username if kind == "lyrics" else cfg.beatmaker_username
+    maker = await effective_maker_username(db, cfg, kind=kind)
     return (
         f"<b>Исполнитель:</b> {html_escape(format_maker_username(maker))}\n"
         "Мы свяжемся с вами."

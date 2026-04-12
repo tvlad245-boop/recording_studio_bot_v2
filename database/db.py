@@ -288,6 +288,29 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
+    async def complete_service_order(self, booking_id: int, kind: str) -> dict[str, Any] | None:
+        """Активная заявка текст/бит → completed (исполнитель нажал «Выполнено» в канале)."""
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                """
+                SELECT * FROM bookings
+                WHERE id = ? AND status = 'active' AND booking_kind = ?
+                """,
+                (booking_id, kind),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            await db.execute(
+                "UPDATE bookings SET status = 'completed' WHERE id = ? AND status = 'active'",
+                (booking_id,),
+            )
+            await db.commit()
+            cur2 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r2 = await cur2.fetchone()
+            return dict(r2) if r2 else None
+
     async def seed_days(self, days_ahead: int) -> None:
         """
         Создаёт рабочие дни и дефолтные слоты на N дней вперёд (включая сегодня).

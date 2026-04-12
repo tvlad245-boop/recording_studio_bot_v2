@@ -21,6 +21,8 @@ from handlers.user import (
     delete_booking_pending_ui_messages,
     delete_pending_ui_and_send_main_menu,
     finalize_confirmed_payment,
+    remove_booking_from_user_activity,
+    remove_service_order_from_user_activity,
     _publish_weekly_and_tasks,
 )
 from keyboards import month_calendar_kb, now_month
@@ -304,15 +306,9 @@ _CHANNEL_EDIT_PROMPTS: dict[str, tuple[str, str, str]] = {
 
 _CHANNEL_SETTING_KEYS = frozenset(v[0] for v in _CHANNEL_EDIT_PROMPTS.values())
 
-_CLIENT_TEXT_SETTING_KEYS = frozenset({"manager_contact_html", "cancel_refund_warning_html"})
+_CLIENT_TEXT_SETTING_KEYS = frozenset({"cancel_refund_warning_html"})
 
 _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
-    "manager": (
-        "manager_contact_html",
-        "Контакт менеджера",
-        "HTML-блок (ссылка, @username, телефон). Показывается при ожидании оплаты, отмены, переноса и в итоговых сообщениях. "
-        "Один символ <code>-</code> — очистить.",
-    ),
     "refund": (
         "cancel_refund_warning_html",
         "Предупреждение о возврате",
@@ -321,19 +317,59 @@ _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
     ),
 }
 
+_CONTACTS_SETTING_KEYS = frozenset({"textmaker_username", "beatmaker_username", "manager_contact_html"})
+
+_CONTACT_PROMPTS: dict[str, tuple[str, str, str]] = {
+    "textmaker": (
+        "textmaker_username",
+        "Контакт текстовика",
+        "Одна строка: @username или текст. Пустое значение в боте — брать из .env (TEXTMAKER_USERNAME). "
+        "Символ <code>-</code> — сбросить и снова использовать .env.",
+    ),
+    "beatmaker": (
+        "beatmaker_username",
+        "Контакт битмейкера",
+        "Одна строка: @username или текст. Пустое — из .env (BEATMAKER_USERNAME). "
+        "<code>-</code> — сброс к .env.",
+    ),
+    "manager": (
+        "manager_contact_html",
+        "Контакт менеджера",
+        "HTML-блок (ссылка, телефон, @username): в ожидании оплаты/отмены/переноса и в итоговых сообщениях. "
+        "<code>-</code> — очистить.",
+    ),
+}
+
 
 def _client_texts_admin_text() -> str:
     return (
         "<b>✉️ Тексты для клиентов</b>\n\n"
-        "• <b>Контакт менеджера</b> — блок HTML для клиентов.\n"
-        "• <b>Предупреждение о возврате</b> — если время аренды уже началось."
+        "• <b>Предупреждение о возврате</b> — если время аренды уже началось (см. также раздел «Контакты» для контактов)."
     )
 
 
 def _client_texts_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="👤 Контакт менеджера", callback_data="adtx:manager")
     kb.button(text="⚠️ Предупреждение о возврате", callback_data="adtx:refund")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _contacts_admin_text() -> str:
+    return (
+        "<b>📇 Контакты</b>\n\n"
+        "Контакты текстовика и битмейкера показываются в задачах в канале, в «Моих заявках» и в сводке после оплаты. "
+        "Менеджер — HTML в сообщениях клиенту.\n"
+        "Пустое поле в боте = значение из .env."
+    )
+
+
+def _contacts_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Текстовик", callback_data="adct:textmaker")
+    kb.button(text="🎚 Битмейкер", callback_data="adct:beatmaker")
+    kb.button(text="👤 Менеджер (HTML)", callback_data="adct:manager")
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -392,6 +428,7 @@ def admin_menu_kb():
     kb.button(text="🖼 Картинки интерфейса", callback_data="admin:ui_photos")
     kb.button(text="📡 Каналы и чаты", callback_data="admin:channels")
     kb.button(text="✉️ Тексты для клиентов", callback_data="admin:client_texts")
+    kb.button(text="📇 Контакты", callback_data="admin:contacts")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -527,6 +564,16 @@ async def admin_actions(
             callback,
             _client_texts_admin_text(),
             _client_texts_menu_kb(),
+        )
+        await callback.answer()
+        return
+
+    if action == "contacts":
+        await state.clear()
+        await _admin_edit_panel(
+            callback,
+            _contacts_admin_text(),
+            _contacts_menu_kb(),
         )
         await callback.answer()
         return
@@ -783,6 +830,16 @@ async def admin_cancel_booking(
     kind = booking.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await _publish_weekly_and_tasks(message.bot, db, config)
+    try:
+        await remove_booking_from_user_activity(
+            message.bot,
+            db,
+            config,
+            user_id=int(booking["user_id"]),
+            booking_id=booking_id,
+        )
+    except Exception:
+        pass
     try:
         await message.bot.send_message(booking["user_id"], f"Ваша запись #{booking_id} была отменена администратором.")
     except Exception:
@@ -1179,6 +1236,33 @@ async def admin_channels_sub(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adct:"))
+async def admin_contacts_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sub = callback.data.split(":", maxsplit=1)[1]
+    meta = _CONTACT_PROMPTS.get(sub)
+    if not meta:
+        await callback.answer()
+        return
+    sk, title, hint = meta
+    await state.set_state(AdminStates.wait_setting_text)
+    await state.update_data(
+        setting_key=sk,
+        admin_panel_mid=callback.message.message_id,
+        admin_panel_cid=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"<b>{html_escape(title)}</b>\n\n{hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_abort_kb(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("adtx:"))
 async def admin_client_texts_sub(
     callback: CallbackQuery, state: FSMContext, config: Config, db: Database
@@ -1439,6 +1523,14 @@ async def admin_wait_setting_text(
                 text=_client_texts_admin_text(),
                 reply_markup=_client_texts_menu_kb(),
             )
+        elif key in _CONTACTS_SETTING_KEYS:
+            await _restore_admin_panel_message(
+                message.bot,
+                int(cid),
+                int(mid),
+                text=_contacts_admin_text(),
+                reply_markup=_contacts_menu_kb(),
+            )
         else:
             await _restore_admin_panel_message(message.bot, int(cid), int(mid))
     try:
@@ -1537,7 +1629,7 @@ async def payment_reject(
         "Если вы уже перевели средства, напишите администратору. "
         "Можно оформить новую заявку через меню."
     )
-    pay_reject = await append_manager_contact_html(db, pay_reject)
+    pay_reject = await append_manager_contact_html(db, pay_reject, config)
     try:
         await callback.bot.send_message(
             int(row["user_id"]),
@@ -1559,6 +1651,50 @@ async def payment_reject(
         except Exception:
             pass
     await callback.answer("Отклонено")
+
+
+@router.callback_query(F.data.startswith("task_done:"))
+async def channel_task_mark_done(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    kind, bid_s = parts[1], parts[2]
+    if kind not in ("lyrics", "beat"):
+        await callback.answer()
+        return
+    try:
+        bid = int(bid_s)
+    except ValueError:
+        await callback.answer()
+        return
+    row = await db.complete_service_order(bid, kind)
+    if not row:
+        await callback.answer("Уже выполнено или не найдено", show_alert=True)
+        return
+    uid = int(row["user_id"])
+    try:
+        await remove_service_order_from_user_activity(
+            callback.bot,
+            db,
+            config,
+            user_id=uid,
+            booking_id=bid,
+        )
+    except Exception:
+        pass
+    try:
+        await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        pass
+    await callback.answer("Готово")
 
 
 @router.callback_query(F.data.startswith("cnc:ok:"))
@@ -1589,12 +1725,22 @@ async def user_cancellation_approve(
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
         await _publish_weekly_and_tasks(callback.bot, db, config)
+    try:
+        await remove_booking_from_user_activity(
+            callback.bot,
+            db,
+            config,
+            user_id=int(row["user_id"]),
+            booking_id=bid,
+        )
+    except Exception:
+        pass
     lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
     warn = await cancel_refund_warning_html(db, config)
     if Database.booking_time_started(snap, timezone=config.timezone) and warn:
         lines.append(warn)
     user_text = "\n\n".join(lines)
-    user_text = await append_manager_contact_html(db, user_text)
+    user_text = await append_manager_contact_html(db, user_text, config)
     try:
         await delete_pending_ui_and_send_main_menu(
             callback.bot,
@@ -1642,6 +1788,7 @@ async def user_cancellation_reject(
         db,
         "<b>Запрос на отмену отклонён</b>\n\n"
         "Ваша запись остаётся в силе.",
+        config,
     )
     try:
         await delete_pending_ui_and_send_main_menu(
@@ -1699,7 +1846,7 @@ async def user_reschedule_approve(
         f"<b>Новая дата и время:</b> {html_escape(str(b['day']))} "
         f"{html_escape(str(b['start_time']))} — {html_escape(str(b['end_time']))}"
     )
-    msg = await append_manager_contact_html(db, msg)
+    msg = await append_manager_contact_html(db, msg, config)
     try:
         await delete_pending_ui_and_send_main_menu(
             callback.bot,
@@ -1747,6 +1894,7 @@ async def user_reschedule_reject(
         db,
         "<b>Запрос на перенос отклонён</b>\n\n"
         "Ваша запись остаётся на прежние дату и время.",
+        config,
     )
     try:
         await delete_pending_ui_and_send_main_menu(
