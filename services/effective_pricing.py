@@ -61,6 +61,10 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "subscription_channel_link": "",
         "schedule_channel_id": "",
         "payments_inbox_chat_id": "",
+        "manager_contact_html": "",
+        "cancel_refund_warning_html": (
+            "<i>Если время аренды уже началось, возврат средств за эту запись не производится.</i>"
+        ),
     }
     return d
 

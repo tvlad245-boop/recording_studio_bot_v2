@@ -12,6 +12,8 @@ class BookingStates(StatesGroup):
     entering_contacts = State()
     waiting_payment = State()
     awaiting_payment_confirm = State()
+    reschedule_pick_date = State()
+    reschedule_pick_slot = State()
 
 
 class AdminStates(StatesGroup):

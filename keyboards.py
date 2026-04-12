@@ -203,6 +203,47 @@ def slots_pick_kb(slots: list[dict], selected_ids: set[int]) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def slots_rs_pick_kb(slots: list[dict], selected_ids: set[int]) -> InlineKeyboardMarkup:
+    """Сетка слотов для переноса записи (отдельные callback от обычной записи)."""
+    _sp = "\u2800"
+
+    def _slot_btn(slot: dict) -> InlineKeyboardButton:
+        sid = int(slot["id"])
+        label = f"{slot['start_time']}-{slot['end_time']}"
+        if not Database.slot_row_is_active(slot["is_active"]):
+            return InlineKeyboardButton(text=f"❌ {label}", callback_data="noop")
+        if sid in selected_ids:
+            return InlineKeyboardButton(text=f"☑ {label}", callback_data=f"rs_pick:{sid}")
+        return InlineKeyboardButton(text=f"✅ {label}", callback_data=f"rs_pick:{sid}")
+
+    def _start_hour(slot: dict) -> int:
+        h, _ = Database.time_sort_key(Database._coerce_cell_str(slot["start_time"]))
+        return int(h)
+
+    left_slots = [s for s in slots if _start_hour(s) < 12]
+    right_slots = [s for s in slots if _start_hour(s) >= 12]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    n_rows = max(len(left_slots), len(right_slots))
+    for i in range(n_rows):
+        left = (
+            _slot_btn(left_slots[i])
+            if i < len(left_slots)
+            else InlineKeyboardButton(text=_sp, callback_data="noop")
+        )
+        right = (
+            _slot_btn(right_slots[i])
+            if i < len(right_slots)
+            else InlineKeyboardButton(text=_sp, callback_data="noop")
+        )
+        rows.append([left, right])
+
+    rows.append([InlineKeyboardButton(text="✅ Далее", callback_data="rs_slot_confirm")])
+    rows.append([InlineKeyboardButton(text="⬅ К календарю", callback_data="rscal:back")])
+    rows.append([InlineKeyboardButton(text="⬅ В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def services_kb(selected: set[str]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for code, (title, price) in SERVICES.items():
@@ -231,14 +272,38 @@ def my_booking_kb(booking_id: int) -> InlineKeyboardMarkup:
 
 
 def my_bookings_kb(
-    booking_ids: list[int], *, show_directions: bool = False
+    rows: list,
+    *,
+    show_directions: bool = False,
 ) -> InlineKeyboardMarkup:
+    """rows — словари броней с ключами id, status, booking_kind."""
     kb = InlineKeyboardBuilder()
-    for bid in booking_ids:
+    for b in rows:
+        bid = int(b["id"])
         kb.button(text=f"❌ Отменить #{bid}", callback_data=f"book:cancel:{bid}")
+        kind = b.get("booking_kind") or "studio"
+        st = b.get("status")
+        if kind == "studio" and st == "active":
+            kb.button(text=f"📅 Перенести #{bid}", callback_data=f"book:rsch:{bid}")
     if show_directions:
         kb.button(text="🗺 Как пройти до студии", callback_data="book:directions")
     kb.button(text="⬅ В меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def cancel_confirm_kb(booking_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, отменить", callback_data=f"book:cc:yes:{booking_id}")
+    kb.button(text="⬅ Не отменять", callback_data=f"book:cc:no:{booking_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def reschedule_confirm_kb(booking_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Запросить перенос", callback_data=f"book:rsc:send:{booking_id}")
+    kb.button(text="⬅ Отмена", callback_data=f"book:rsc:abort:{booking_id}")
     kb.adjust(1)
     return kb.as_markup()
 

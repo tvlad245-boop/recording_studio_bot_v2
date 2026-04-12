@@ -7,6 +7,7 @@ import aiosqlite
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
+import json
 
 
 def default_hourly_slots() -> list[tuple[str, str]]:
@@ -128,6 +129,7 @@ class Database:
             await self._migrate_bookings_tg_username()
             await self._migrate_bookings_requires_engineer()
             await self._migrate_bookings_client_cleanup()
+            await self._migrate_bookings_pending_meta()
 
     async def _migrate_bookings_booked_slot_ids(self) -> None:
         async with self.connect() as db:
@@ -175,6 +177,15 @@ class Database:
             self._configure(db)
             try:
                 await db.execute("ALTER TABLE bookings ADD COLUMN client_cleanup_json TEXT")
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+    async def _migrate_bookings_pending_meta(self) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            try:
+                await db.execute("ALTER TABLE bookings ADD COLUMN pending_meta TEXT")
                 await db.commit()
             except aiosqlite.OperationalError:
                 pass
@@ -305,7 +316,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT 1 FROM bookings
-                WHERE day = ? AND status IN ('active', 'pending_payment')
+                WHERE day = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                 LIMIT 1
                 """,
                 (day,),
@@ -375,7 +388,9 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE day = ?
-                  AND status IN ('active', 'pending_payment')
+                  AND status IN (
+                      'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                  )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
                 """,
@@ -476,7 +491,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT 1 FROM bookings
-                WHERE user_id = ? AND status IN ('active', 'pending_payment')
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                 LIMIT 1
                 """,
                 (user_id,),
@@ -490,7 +507,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT 1 FROM bookings
-                WHERE user_id = ? AND status IN ('active', 'pending_payment')
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
                 """,
@@ -504,7 +523,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT * FROM bookings
-                WHERE user_id = ? AND status IN ('active', 'pending_payment')
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                 ORDER BY id DESC
                 """,
                 (user_id,),
@@ -677,7 +698,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT 1 FROM bookings
-                WHERE user_id = ? AND status IN ('active', 'pending_payment')
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
                 """,
@@ -774,7 +797,11 @@ class Database:
             self._configure(db)
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT * FROM bookings WHERE id = ? AND status IN ('active', 'pending_payment')",
+                """
+                SELECT * FROM bookings WHERE id = ? AND status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
+                """,
                 (booking_id,),
             )
             row = await cur.fetchone()
@@ -782,7 +809,10 @@ class Database:
                 await db.rollback()
                 return None
             booking = dict(row)
-            await db.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+            await db.execute(
+                "UPDATE bookings SET status = 'cancelled', pending_meta = NULL WHERE id = ?",
+                (booking_id,),
+            )
             kind = booking.get("booking_kind") or "studio"
             if kind in ("lyrics", "beat"):
                 await db.execute("DELETE FROM reminder_jobs WHERE booking_id = ?", (booking_id,))
@@ -831,6 +861,233 @@ class Database:
             row2 = await cur2.fetchone()
             return dict(row2) if row2 else None
 
+    async def request_user_cancellation(self, booking_id: int, user_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                """
+                SELECT * FROM bookings WHERE id = ? AND user_id = ?
+                  AND status IN ('active', 'pending_payment')
+                  AND (booking_kind IS NULL OR booking_kind = 'studio')
+                """,
+                (booking_id, user_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            b = dict(row)
+            meta = json.dumps({"prev": b["status"]})
+            await db.execute(
+                "UPDATE bookings SET status = 'pending_cancel', pending_meta = ? WHERE id = ?",
+                (meta, booking_id),
+            )
+            await db.commit()
+            cur2 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r2 = await cur2.fetchone()
+            return dict(r2) if r2 else None
+
+    async def reject_user_cancellation(self, booking_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                "SELECT * FROM bookings WHERE id = ? AND status = 'pending_cancel'",
+                (booking_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            b = dict(row)
+            prev = "active"
+            try:
+                m = json.loads(b.get("pending_meta") or "{}")
+                p = m.get("prev", "active")
+                if p in ("active", "pending_payment"):
+                    prev = p
+            except (json.JSONDecodeError, TypeError):
+                pass
+            await db.execute(
+                "UPDATE bookings SET status = ?, pending_meta = NULL WHERE id = ?",
+                (prev, booking_id),
+            )
+            await db.commit()
+            cur2 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r2 = await cur2.fetchone()
+            return dict(r2) if r2 else None
+
+    async def reject_user_reschedule(self, booking_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                "SELECT * FROM bookings WHERE id = ? AND status = 'pending_reschedule'",
+                (booking_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            await db.execute(
+                "UPDATE bookings SET status = 'active', pending_meta = NULL WHERE id = ?",
+                (booking_id,),
+            )
+            await db.commit()
+            cur2 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r2 = await cur2.fetchone()
+            return dict(r2) if r2 else None
+
+    async def request_user_reschedule(
+        self,
+        booking_id: int,
+        user_id: int,
+        *,
+        new_day: str,
+        new_slot_ids: list[int],
+    ) -> dict[str, Any] | None:
+        if not new_slot_ids:
+            return None
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT * FROM bookings WHERE id = ? AND user_id = ? AND status = 'active'
+                  AND (booking_kind IS NULL OR booking_kind = 'studio')
+                """,
+                (booking_id, user_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
+
+            placeholders = ",".join("?" * len(new_slot_ids))
+            cur2 = await db.execute(
+                f"SELECT * FROM time_slots WHERE id IN ({placeholders}) AND is_active = 1",
+                tuple(int(x) for x in new_slot_ids),
+            )
+            rows = [dict(r) for r in await cur2.fetchall()]
+            if len(rows) != len(new_slot_ids):
+                await db.rollback()
+                return None
+            rows.sort(
+                key=lambda s: Database.time_sort_key(Database._coerce_cell_str(s["start_time"]))
+            )
+            if any(s["day"] != new_day for s in rows):
+                await db.rollback()
+                return None
+            cur_all = await db.execute(
+                "SELECT id, start_time, end_time, day FROM time_slots WHERE day = ?",
+                (new_day,),
+            )
+            all_day = [dict(r) for r in await cur_all.fetchall()]
+            all_day.sort(
+                key=lambda s: Database.time_sort_key(Database._coerce_cell_str(s["start_time"]))
+            )
+            if not Database.selection_is_valid_multihour_slot_chain(
+                all_day, set(int(x) for x in new_slot_ids), rows
+            ):
+                await db.rollback()
+                return None
+
+            slot_text = f"{rows[0]['start_time']} — {rows[-1]['end_time']}"
+            meta = json.dumps(
+                {
+                    "new_day": new_day,
+                    "new_slot_ids": new_slot_ids,
+                    "slot_text": slot_text,
+                }
+            )
+            await db.execute(
+                "UPDATE bookings SET status = 'pending_reschedule', pending_meta = ? WHERE id = ?",
+                (meta, booking_id),
+            )
+            await db.commit()
+            cur3 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r3 = await cur3.fetchone()
+            return dict(r3) if r3 else None
+
+    async def approve_user_reschedule(self, booking_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT * FROM bookings WHERE id = ? AND status = 'pending_reschedule'",
+                (booking_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
+            booking = dict(row)
+            try:
+                meta = json.loads(booking.get("pending_meta") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                await db.rollback()
+                return None
+            new_day = meta.get("new_day")
+            new_slot_ids = meta.get("new_slot_ids")
+            if not new_day or not new_slot_ids or not isinstance(new_slot_ids, list):
+                await db.rollback()
+                return None
+            new_slot_ids = [int(x) for x in new_slot_ids]
+            placeholders = ",".join("?" * len(new_slot_ids))
+            cur2 = await db.execute(
+                f"SELECT * FROM time_slots WHERE id IN ({placeholders}) AND is_active = 1",
+                tuple(new_slot_ids),
+            )
+            rows = [dict(r) for r in await cur2.fetchall()]
+            if len(rows) != len(new_slot_ids):
+                await db.rollback()
+                return None
+            rows.sort(
+                key=lambda s: Database.time_sort_key(Database._coerce_cell_str(s["start_time"]))
+            )
+            if any(s["day"] != new_day for s in rows):
+                await db.rollback()
+                return None
+
+            ids_str = booking.get("booked_slot_ids")
+            if ids_str:
+                for part in str(ids_str).split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    await db.execute(
+                        "UPDATE time_slots SET is_active = 1 WHERE id = ?",
+                        (int(part),),
+                    )
+            else:
+                await db.execute(
+                    """
+                    UPDATE time_slots SET is_active = 1
+                    WHERE day = ? AND start_time = ? AND end_time = ?
+                    """,
+                    (booking["day"], booking["start_time"], booking["end_time"]),
+                )
+
+            for s in rows:
+                curx = await db.execute(
+                    "UPDATE time_slots SET is_active = 0 WHERE id = ? AND is_active = 1",
+                    (int(s["id"]),),
+                )
+                if curx.rowcount != 1:
+                    await db.rollback()
+                    return None
+
+            start_time = rows[0]["start_time"]
+            end_time = rows[-1]["end_time"]
+            ids_csv = ",".join(str(int(s["id"])) for s in rows)
+            await db.execute(
+                """
+                UPDATE bookings SET day = ?, start_time = ?, end_time = ?,
+                  booked_slot_ids = ?, status = 'active', pending_meta = NULL
+                WHERE id = ?
+                """,
+                (new_day, start_time, end_time, ids_csv, booking_id),
+            )
+            await db.commit()
+            cur3 = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+            r3 = await cur3.fetchone()
+            return dict(r3) if r3 else None
+
     async def get_day_schedule(self, day: str) -> list[dict[str, Any]]:
         async with self.connect() as db:
             self._configure(db)
@@ -841,7 +1098,9 @@ class Database:
                 FROM time_slots ts
                 LEFT JOIN bookings b
                     ON b.day = ts.day
-                   AND b.status IN ('active', 'pending_payment')
+                   AND b.status IN (
+                       'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                   )
                    AND (b.booking_kind IS NULL OR b.booking_kind = 'studio')
                    AND (
                         (b.booked_slot_ids IS NOT NULL
@@ -894,7 +1153,9 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT 1 FROM bookings
-                WHERE status IN ('active', 'pending_payment')
+                WHERE status IN (
+                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                   AND booked_slot_ids IS NOT NULL
                   AND ',' || booked_slot_ids || ',' LIKE '%,' || ? || ',%'
@@ -1000,4 +1261,12 @@ class Database:
         d = date.fromisoformat(booking["day"])
         t = time.fromisoformat(booking["start_time"])
         return datetime.combine(d, t)
+
+    @staticmethod
+    def booking_time_started(booking: dict[str, Any], *, timezone: str) -> bool:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(timezone)
+        start = Database.booking_start_datetime(booking).replace(tzinfo=tz)
+        return datetime.now(tz) >= start
 

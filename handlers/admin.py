@@ -17,15 +17,25 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import Config
 from database.db import Database
-from handlers.user import delete_booking_pending_ui_messages, finalize_confirmed_payment
+from handlers.user import (
+    delete_booking_pending_ui_messages,
+    delete_pending_ui_and_send_main_menu,
+    finalize_confirmed_payment,
+    _publish_weekly_and_tasks,
+)
 from keyboards import month_calendar_kb, now_month
+from services.content_settings import (
+    append_manager_contact_html,
+    cancel_refund_warning_html,
+    equipment_photo_paths,
+    setting_bool,
+)
 from services.channel_settings import (
     effective_payments_inbox_chat_id,
     effective_schedule_channel_id,
     effective_subscription_channel_id,
     effective_subscription_channel_link,
 )
-from services.content_settings import equipment_photo_paths, setting_bool
 from services.effective_pricing import EffectivePricing, load_effective_pricing
 from services.reminders import ReminderService
 from states import AdminStates
@@ -294,6 +304,40 @@ _CHANNEL_EDIT_PROMPTS: dict[str, tuple[str, str, str]] = {
 
 _CHANNEL_SETTING_KEYS = frozenset(v[0] for v in _CHANNEL_EDIT_PROMPTS.values())
 
+_CLIENT_TEXT_SETTING_KEYS = frozenset({"manager_contact_html", "cancel_refund_warning_html"})
+
+_ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
+    "manager": (
+        "manager_contact_html",
+        "Контакт менеджера",
+        "HTML-блок (ссылка, @username, телефон). Показывается при ожидании оплаты, отмены, переноса и в итоговых сообщениях. "
+        "Один символ <code>-</code> — очистить.",
+    ),
+    "refund": (
+        "cancel_refund_warning_html",
+        "Предупреждение о возврате",
+        "Текст показывается при отмене записи, если время аренды уже началось, и в сообщении клиенту после подтверждённой отмены в этом случае. "
+        "Один символ <code>-</code> — взять текст по умолчанию из настроек бота.",
+    ),
+}
+
+
+def _client_texts_admin_text() -> str:
+    return (
+        "<b>✉️ Тексты для клиентов</b>\n\n"
+        "• <b>Контакт менеджера</b> — блок HTML для клиентов.\n"
+        "• <b>Предупреждение о возврате</b> — если время аренды уже началось."
+    )
+
+
+def _client_texts_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Контакт менеджера", callback_data="adtx:manager")
+    kb.button(text="⚠️ Предупреждение о возврате", callback_data="adtx:refund")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
 
 def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -347,6 +391,7 @@ def admin_menu_kb():
     kb.button(text="📍 Адрес и «как пройти»", callback_data="admin:studio_nav")
     kb.button(text="🖼 Картинки интерфейса", callback_data="admin:ui_photos")
     kb.button(text="📡 Каналы и чаты", callback_data="admin:channels")
+    kb.button(text="✉️ Тексты для клиентов", callback_data="admin:client_texts")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -471,6 +516,17 @@ async def admin_actions(
             callback,
             _channels_admin_text(s, config),
             _channels_menu_kb(),
+        )
+        await callback.answer()
+        return
+
+    if action == "client_texts":
+        await state.clear()
+        s = await db.get_all_settings()
+        await _admin_edit_panel(
+            callback,
+            _client_texts_admin_text(),
+            _client_texts_menu_kb(),
         )
         await callback.answer()
         return
@@ -1120,6 +1176,33 @@ async def admin_channels_sub(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adtx:"))
+async def admin_client_texts_sub(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    sub = callback.data.split(":", maxsplit=1)[1]
+    meta = _ADTX_PROMPTS.get(sub)
+    if not meta:
+        await callback.answer()
+        return
+    sk, title, hint = meta
+    await state.set_state(AdminStates.wait_setting_text)
+    await state.update_data(
+        setting_key=sk,
+        admin_panel_mid=callback.message.message_id,
+        admin_panel_cid=callback.message.chat.id,
+    )
+    await callback.message.edit_text(
+        f"<b>{html_escape(title)}</b>\n\n{hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_abort_kb(),
+    )
+    await callback.answer()
+
+
 @router.message(AdminStates.equipment_photo_wait, F.photo)
 async def admin_equipment_got_photo(
     message: Message, state: FSMContext, db: Database, config: Config
@@ -1344,6 +1427,15 @@ async def admin_wait_setting_text(
                 text=_channels_admin_text(s2, config),
                 reply_markup=_channels_menu_kb(),
             )
+        elif key in _CLIENT_TEXT_SETTING_KEYS:
+            s2 = await db.get_all_settings()
+            await _restore_admin_panel_message(
+                message.bot,
+                int(cid),
+                int(mid),
+                text=_client_texts_admin_text(),
+                reply_markup=_client_texts_menu_kb(),
+            )
         else:
             await _restore_admin_panel_message(message.bot, int(cid), int(mid))
     try:
@@ -1436,12 +1528,16 @@ async def payment_reject(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
+    pay_reject = (
+        "<b>Оплата не подтверждена</b>\n\n"
+        "Если вы уже перевели средства, напишите администратору. "
+        "Можно оформить новую заявку через меню."
+    )
+    pay_reject = await append_manager_contact_html(db, pay_reject)
     try:
         await callback.bot.send_message(
             int(row["user_id"]),
-            "<b>Оплата не подтверждена</b>\n\n"
-            "Если вы уже перевели средства, напишите администратору. "
-            "Можно оформить новую заявку через меню.",
+            pay_reject,
             parse_mode=ParseMode.HTML,
         )
     except Exception:
@@ -1450,6 +1546,217 @@ async def payment_reject(
         t = callback.message.text or callback.message.caption or ""
         await callback.message.edit_text(
             t + "\n\n<b>❌ Оплата отклонена</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer("Отклонено")
+
+
+@router.callback_query(F.data.startswith("cnc:ok:"))
+async def user_cancellation_approve(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+    reminder_service: ReminderService,
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        bid = int(callback.data.split(":")[2])
+    except ValueError:
+        await callback.answer()
+        return
+    b = await db.get_booking_by_id(bid)
+    if not b or b.get("status") != "pending_cancel":
+        await callback.answer("Уже обработано или не найдено", show_alert=True)
+        return
+    snap = dict(b)
+    row = await db.cancel_booking(bid)
+    if not row:
+        await callback.answer("Ошибка отмены", show_alert=True)
+        return
+    kind = row.get("booking_kind") or "studio"
+    if kind in (None, "studio"):
+        await reminder_service.remove_for_booking(bid)
+    lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
+    warn = await cancel_refund_warning_html(db, config)
+    if Database.booking_time_started(snap, timezone=config.timezone) and warn:
+        lines.append(warn)
+    user_text = "\n\n".join(lines)
+    user_text = await append_manager_contact_html(db, user_text)
+    try:
+        await delete_pending_ui_and_send_main_menu(
+            callback.bot,
+            db,
+            config,
+            booking_snapshot=row,
+            announcement_html=user_text,
+        )
+    except Exception:
+        pass
+    try:
+        t = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            t + "\n\n<b>✅ Отмена подтверждена</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer("Подтверждено")
+
+
+@router.callback_query(F.data.startswith("cnc:no:"))
+async def user_cancellation_reject(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        bid = int(callback.data.split(":")[2])
+    except ValueError:
+        await callback.answer()
+        return
+    row = await db.reject_user_cancellation(bid)
+    if not row:
+        await callback.answer("Уже обработано", show_alert=True)
+        return
+    rej = await append_manager_contact_html(
+        db,
+        "<b>Запрос на отмену отклонён</b>\n\n"
+        "Ваша запись остаётся в силе.",
+    )
+    try:
+        await delete_pending_ui_and_send_main_menu(
+            callback.bot,
+            db,
+            config,
+            booking_snapshot=row,
+            announcement_html=rej,
+        )
+    except Exception:
+        pass
+    try:
+        t = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            t + "\n\n<b>❌ Отмена отклонена</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer("Отклонено")
+
+
+@router.callback_query(F.data.startswith("rsc:ok:"))
+async def user_reschedule_approve(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+    reminder_service: ReminderService,
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        bid = int(callback.data.split(":")[2])
+    except ValueError:
+        await callback.answer()
+        return
+    b = await db.approve_user_reschedule(bid)
+    if not b:
+        await callback.answer(
+            "Слоты заняты или заявка уже обработана. Попробуйте позже.",
+            show_alert=True,
+        )
+        return
+    await reminder_service.remove_for_booking(bid)
+    await reminder_service.schedule_for_booking(b)
+    await _publish_weekly_and_tasks(callback.bot, db, config)
+    uid = int(b["user_id"])
+    msg = (
+        "<b>Перенос подтверждён</b>\n\n"
+        f"<b>Новая дата и время:</b> {html_escape(str(b['day']))} "
+        f"{html_escape(str(b['start_time']))} — {html_escape(str(b['end_time']))}"
+    )
+    msg = await append_manager_contact_html(db, msg)
+    try:
+        await delete_pending_ui_and_send_main_menu(
+            callback.bot,
+            db,
+            config,
+            booking_snapshot=b,
+            announcement_html=msg,
+        )
+    except Exception:
+        pass
+    try:
+        t = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            t + "\n\n<b>✅ Перенос подтверждён</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer("Подтверждено")
+
+
+@router.callback_query(F.data.startswith("rsc:no:"))
+async def user_reschedule_reject(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        bid = int(callback.data.split(":")[2])
+    except ValueError:
+        await callback.answer()
+        return
+    row = await db.reject_user_reschedule(bid)
+    if not row:
+        await callback.answer("Уже обработано", show_alert=True)
+        return
+    rej = await append_manager_contact_html(
+        db,
+        "<b>Запрос на перенос отклонён</b>\n\n"
+        "Ваша запись остаётся на прежние дату и время.",
+    )
+    try:
+        await delete_pending_ui_and_send_main_menu(
+            callback.bot,
+            db,
+            config,
+            booking_snapshot=row,
+            announcement_html=rej,
+        )
+    except Exception:
+        pass
+    try:
+        t = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            t + "\n\n<b>❌ Перенос отклонён</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=None,
         )

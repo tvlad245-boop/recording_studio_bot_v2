@@ -34,6 +34,9 @@ from services.content_settings import (
     equipment_photo_paths,
     format_maker_username as _format_maker_username,
     post_payment_contact_block_html,
+    append_manager_contact_html,
+    cancel_refund_warning_html,
+    manager_contact_html,
     studio_address_html,
     studio_directions_video_file_id,
     ui_photo_main_menu,
@@ -48,11 +51,14 @@ from keyboards import (
     booking_products_kb,
     equipment_carousel_kb,
     main_menu_kb,
+    cancel_confirm_kb,
     month_calendar_kb,
     my_bookings_kb,
     now_month,
     paid_kb,
+    reschedule_confirm_kb,
     slots_pick_kb,
+    slots_rs_pick_kb,
     studio_mode_kb,
     subscription_kb,
     tariff_category_kb,
@@ -133,6 +139,13 @@ async def _bulk_delete_chat_messages(bot, chat_id: int, message_ids: Iterable[in
                 *[bot.delete_message(chat_id, mid) for mid in chunk],
                 return_exceptions=True,
             )
+
+
+def _booking_hours_count(b: dict[str, Any]) -> int:
+    raw = (b.get("booked_slot_ids") or "").strip()
+    if raw:
+        return len([x for x in raw.split(",") if x.strip()])
+    return 1
 
 
 def _format_tg_username(u: str | None) -> str:
@@ -300,6 +313,51 @@ async def delete_booking_pending_ui_messages(bot: Bot, booking: dict[str, Any]) 
         pass
 
 
+async def delete_pending_ui_and_send_main_menu(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    *,
+    booking_snapshot: dict[str, Any],
+    announcement_html: str,
+) -> None:
+    """После решения по заявке: убрать экран ожидания у клиента и показать главное меню."""
+    await delete_booking_pending_ui_messages(bot, booking_snapshot)
+    uid = int(booking_snapshot["user_id"])
+    ann = (announcement_html or "").strip()
+    if ann:
+        try:
+            await bot.send_message(uid, _truncate_html(ann, 4096), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    s = await db.get_all_settings()
+    photo = _file(ui_photo_main_menu(s, config))
+    menu_caption = "<b>🏠 Главное меню</b>\nВыберите действие ниже."
+    if photo:
+        try:
+            await bot.send_photo(
+                uid,
+                photo=photo,
+                caption=_truncate_html(menu_caption, 1024),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_kb(),
+            )
+        except Exception:
+            await bot.send_message(
+                uid,
+                _truncate_html(menu_caption, 4096),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_kb(),
+            )
+    else:
+        await bot.send_message(
+            uid,
+            _truncate_html(menu_caption, 4096),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_kb(),
+        )
+
+
 async def finalize_confirmed_payment(
     bot: Bot,
     db: Database,
@@ -325,6 +383,9 @@ async def finalize_confirmed_payment(
             f"<b>Сумма:</b> {row.get('total_price', 0)} руб\n"
             f"{contact_html}"
         )
+        mgr = await manager_contact_html(db)
+        if mgr:
+            entry += f"\n\n{mgr}"
     else:
         entry = (
             f"<b>Запись #{booking_id}</b>\n"
@@ -337,6 +398,9 @@ async def finalize_confirmed_payment(
         addr = await studio_address_html(db)
         if addr:
             entry += f"\n<b>Адрес студии:</b> {addr}"
+        mgr = await manager_contact_html(db)
+        if mgr:
+            entry += f"\n\n{mgr}"
     await _upsert_user_success_summary(
         bot,
         db,
@@ -358,6 +422,30 @@ def _payment_review_kb(booking_id: int) -> InlineKeyboardMarkup:
                 text="✅ Подтвердить оплату", callback_data=f"pay:ok:{booking_id}"
             ),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"pay:no:{booking_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cancellation_review_kb(booking_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить отмену", callback_data=f"cnc:ok:{booking_id}"
+            ),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"cnc:no:{booking_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _reschedule_review_kb(booking_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить перенос", callback_data=f"rsc:ok:{booking_id}"
+            ),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rsc:no:{booking_id}"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -932,6 +1020,7 @@ async def equipment_nav(callback: CallbackQuery, config: Config, db: Database) -
 async def booking_start(
     callback: CallbackQuery, state: FSMContext, config: Config, db: Database, pricing: EffectivePricing
 ) -> None:
+    await state.clear()
     user_id = callback.from_user.id
     await state.update_data(root_message_id=callback.message.message_id)
     await state.update_data(tg_username=callback.from_user.username or "")
@@ -1032,6 +1121,16 @@ async def sub_check(
     if await is_subscribed(callback.bot, sub_ch, callback.from_user.id):
         data = await state.get_data()
         prod = data.get("product")
+        if prod is None:
+            await callback.answer("Подписка подтверждена", show_alert=True)
+            await state.update_data(tg_username=callback.from_user.username or "")
+            await state.set_state(BookingStates.choosing_product)
+            await _edit(
+                callback.message,
+                "<b>Выберите услугу</b>",
+                reply_markup=booking_products_kb(pricing=pricing),
+            )
+            return
         if prod == "no_engineer" and not pricing.service_no_engineer_enabled:
             await callback.answer("Запись без звукорежиссёра сейчас недоступна.", show_alert=True)
             return
@@ -1842,10 +1941,11 @@ async def paid(
     is_photo = bool(data.get("payment_root_is_photo", False))
 
     async def _edit_waiting() -> None:
-        waiting = (
+        waiting = await append_manager_contact_html(
+            db,
             "<b>⏳ Ожидайте подтверждения</b>\n\n"
             "Мы проверяем оплату. Как только оператор подтвердит заявку, "
-            "вы получите уведомление в этот чат."
+            "вы получите уведомление в этот чат.",
         )
         if root_mid:
             try:
@@ -2008,6 +2108,10 @@ def _format_my_bookings_screen(
         )
         if b.get("status") == "pending_payment":
             lines.append("<i>⏳ Ожидает подтверждения оплаты оператором</i>")
+        if b.get("status") == "pending_cancel":
+            lines.append("<i>⏳ Ожидает подтверждения отмены оператором</i>")
+        if b.get("status") == "pending_reschedule":
+            lines.append("<i>⏳ Ожидает подтверждения переноса оператором</i>")
         if kind in ("lyrics", "beat"):
             maker = config.textmaker_username if kind == "lyrics" else config.beatmaker_username
             lines.append(f"<b>Исполнитель:</b> {html_escape(_format_maker_username(maker))}")
@@ -2060,7 +2164,7 @@ async def my_booking(callback: CallbackQuery, db: Database, config: Config) -> N
     await _present_my_bookings_message(
         callback,
         text,
-        my_bookings_kb(ids, show_directions=has_studio),
+        my_bookings_kb(rows, show_directions=has_studio),
     )
     await callback.answer()
 
@@ -2105,33 +2209,522 @@ async def book_directions_to_studio(callback: CallbackQuery, db: Database) -> No
 
 
 @router.callback_query(F.data.startswith("book:cancel:"))
-async def cancel_own(callback: CallbackQuery, db: Database, config: Config, reminder_service: ReminderService) -> None:
+async def cancel_prompt(callback: CallbackQuery, db: Database, config: Config) -> None:
     booking_id = int(callback.data.split(":")[2])
     booking = await db.get_booking_by_id(booking_id)
     if not booking or booking["user_id"] != callback.from_user.id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
-    cancelled = await db.cancel_booking(booking_id)
-    if not cancelled:
-        await callback.answer("Не удалось отменить запись", show_alert=True)
+    if (booking.get("booking_kind") or "studio") != "studio":
+        await callback.answer("Для этой заявки отмена через бота недоступна.", show_alert=True)
         return
-    kind = cancelled.get("booking_kind") or "studio"
-    if kind in (None, "studio"):
-        await reminder_service.remove_for_booking(booking_id)
-    lines = ["<b>❌ Заявка отменена.</b>"]
-    if kind in (None, "studio"):
-        lines.append("Слот снова доступен.")
-    extra_top = "\n".join(lines)
-    await _present_main_menu_on_message(
-        callback.bot,
-        chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        config=config,
-        db=db,
-        extra_top_html=extra_top,
+    st = booking.get("status")
+    if st not in ("active", "pending_payment"):
+        await callback.answer("Заявка не может быть отменена в этом статусе.", show_alert=True)
+        return
+    lines: list[str] = ["<b>Отменить запись?</b>", ""]
+    warn = await cancel_refund_warning_html(db, config)
+    if Database.booking_time_started(booking, timezone=config.timezone) and warn:
+        lines.append(warn)
+        lines.append("")
+    lines.append(
+        "Запрос на отмену будет отправлен оператору — слот останется занятым до подтверждения."
     )
-    await _publish_weekly_and_tasks(callback.bot, db, config)
-    await callback.answer("Готово")
+    text = "\n".join(lines)
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(
+                caption=_truncate_html(text, 1024),
+                reply_markup=cancel_confirm_kb(booking_id),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await callback.message.edit_text(
+                _truncate_html(text, 4096),
+                reply_markup=cancel_confirm_kb(booking_id),
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        await callback.message.answer(
+            _truncate_html(text, 4096),
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_confirm_kb(booking_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book:cc:no:"))
+async def cancel_prompt_abort(callback: CallbackQuery, db: Database, config: Config, state: FSMContext) -> None:
+    await state.clear()
+    rows = await db.get_user_active_bookings(callback.from_user.id)
+    if not rows:
+        await _present_my_bookings_message(callback, "Активных заявок нет.", main_menu_kb())
+        await callback.answer()
+        return
+    addr = await studio_address_html(db)
+    text = _format_my_bookings_screen(rows, config, studio_address_html=addr)
+    has_studio = any((b.get("booking_kind") or "studio") == "studio" for b in rows)
+    await _present_my_bookings_message(
+        callback, text, my_bookings_kb(rows, show_directions=has_studio)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book:cc:yes:"))
+async def cancel_request_send(
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+    state: FSMContext,
+) -> None:
+    booking_id = int(callback.data.split(":")[3])
+    booking = await db.get_booking_by_id(booking_id)
+    if not booking or booking["user_id"] != callback.from_user.id:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    row = await db.request_user_cancellation(booking_id, callback.from_user.id)
+    if not row:
+        await callback.answer("Не удалось отправить запрос.", show_alert=True)
+        return
+    await state.clear()
+    s = await db.get_all_settings()
+    inbox = effective_payments_inbox_chat_id(s, config)
+    client_tg = _format_tg_username(booking.get("tg_username"))
+    admin_text = (
+        "<b>❌ Запрос на отмену записи</b>\n\n"
+        f"<b>ID:</b> <code>#{booking_id}</code>\n"
+        f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+        f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
+        f"<b>Дата:</b> {html_escape(str(booking['day']))}\n"
+        f"<b>Время:</b> {html_escape(str(booking['start_time']))} — {html_escape(str(booking['end_time']))}\n"
+        f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
+        f"<b>Сумма:</b> {booking['total_price']} руб"
+    )
+    try:
+        await callback.bot.send_message(
+            inbox,
+            admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_cancellation_review_kb(booking_id),
+        )
+    except Exception:
+        await callback.bot.send_message(
+            config.admin_id,
+            admin_text + "\n\n<i>(не удалось отправить в чат заявок)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_cancellation_review_kb(booking_id),
+        )
+    wait = await append_manager_contact_html(
+        db,
+        "<b>⏳ Запрос на отмену отправлен</b>\n\n"
+        "Ожидайте решения оператора. Слот пока занят.",
+    )
+    chat_id = callback.message.chat.id
+    wait_mid = callback.message.message_id
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(
+                caption=_truncate_html(wait, 1024),
+                reply_markup=None,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await callback.message.edit_text(
+                _truncate_html(wait, 4096),
+                reply_markup=None,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        sent = await callback.message.answer(wait, parse_mode=ParseMode.HTML)
+        wait_mid = sent.message_id
+        chat_id = sent.chat.id
+    await db.update_booking_client_cleanup(
+        booking_id,
+        json.dumps(
+            {"chat_id": chat_id, "root": wait_mid, "extra": []},
+            ensure_ascii=False,
+        ),
+    )
+    await callback.answer("Запрос отправлен")
+
+
+def _rs_slots_caption(day: str, n_selected: int, need: int) -> str:
+    return (
+        f"<b>Новая дата:</b> {day}\n\n"
+        f"Отметьте <b>{need}</b> подряд идущих свободных часов, затем «Далее».\n"
+        f"<b>Выбрано:</b> {n_selected} / {need}"
+    )
+
+
+@router.callback_query(F.data.startswith("book:rsch:"))
+async def reschedule_start(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    bid = int(callback.data.split(":")[2])
+    booking = await db.get_booking_by_id(bid)
+    if not booking or booking["user_id"] != callback.from_user.id:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    if (booking.get("booking_kind") or "studio") != "studio" or booking.get("status") != "active":
+        await callback.answer(
+            "Перенос доступен только для подтверждённой записи на студию.",
+            show_alert=True,
+        )
+        return
+    hours = _booking_hours_count(booking)
+    eng = int(booking.get("requires_engineer") or 0) == 1
+    y, m = now_month()
+    await state.set_state(BookingStates.reschedule_pick_date)
+    await state.update_data(
+        rs_bid=bid,
+        rs_hours=hours,
+        rs_engineer=eng,
+        cal_year=y,
+        cal_month=m,
+    )
+    available_days = set(await db.get_available_days(days_ahead=60))
+    blocked: set[str] = set()
+    if eng:
+        from datetime import datetime as _dt
+
+        for d in list(available_days):
+            wd = _dt.fromisoformat(d).weekday()
+            if wd in (5, 6):
+                blocked.add(d)
+        available_days = {d for d in available_days if d not in blocked}
+    closed_admin = await db.get_closed_days_in_month(y, m)
+    await _edit(
+        callback.message,
+        "<b>📅 Выберите новую дату</b>\n\n"
+        "✅ — есть свободные слоты под вашу длительность.",
+        reply_markup=month_calendar_kb(
+            y,
+            m,
+            allowed_days=available_days,
+            blocked_days=blocked | closed_admin,
+            prefix="rsdate",
+            nav_prefix="rscal",
+            nav_back_callback="book:rsc:quit",
+            nav_back_text="⬅ Отмена",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rscal:"), BookingStates.reschedule_pick_date)
+async def reschedule_calendar_nav(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    payload = callback.data.split(":", maxsplit=1)[1]
+    if payload == "back":
+        await callback.answer()
+        return
+    y_str, m_str = payload.split("-")
+    y, m = int(y_str), int(m_str)
+    await state.update_data(cal_year=y, cal_month=m)
+    available_days = set(await db.get_available_days(days_ahead=60))
+    data = await state.get_data()
+    eng = bool(data.get("rs_engineer"))
+    blocked: set[str] = set()
+    if eng:
+        from datetime import datetime as _dt
+
+        for d in list(available_days):
+            wd = _dt.fromisoformat(d).weekday()
+            if wd in (5, 6):
+                blocked.add(d)
+        available_days = {d for d in available_days if d not in blocked}
+    closed_admin = await db.get_closed_days_in_month(y, m)
+    await _edit(
+        callback.message,
+        "<b>📅 Выберите новую дату</b>",
+        reply_markup=month_calendar_kb(
+            y,
+            m,
+            allowed_days=available_days,
+            blocked_days=blocked | closed_admin,
+            prefix="rsdate",
+            nav_prefix="rscal",
+            nav_back_callback="book:rsc:quit",
+            nav_back_text="⬅ Отмена",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rsdate:"), BookingStates.reschedule_pick_date)
+async def reschedule_pick_day(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    picked_day = callback.data.split(":", maxsplit=1)[1]
+    slots = await db.get_all_slots_for_day(picked_day)
+    if not slots:
+        await callback.answer("На эту дату нет слотов.", show_alert=True)
+        return
+    if not any(Database.slot_row_is_active(s["is_active"]) for s in slots):
+        await callback.answer("Нет свободных слотов", show_alert=True)
+        return
+    data = await state.get_data()
+    need = int(data.get("rs_hours") or 1)
+    await state.set_state(BookingStates.reschedule_pick_slot)
+    await state.update_data(rs_day=picked_day, rs_selected_slot_ids=[])
+    await _edit(
+        callback.message,
+        _rs_slots_caption(picked_day, 0, need),
+        reply_markup=slots_rs_pick_kb(slots, set()),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rs_pick:"), BookingStates.reschedule_pick_slot)
+async def reschedule_slot_toggle(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    sid = int(callback.data.split(":", maxsplit=1)[1])
+    data = await state.get_data()
+    day = data.get("rs_day")
+    need = int(data.get("rs_hours") or 1)
+    if not day:
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    slots = await db.get_all_slots_for_day(day)
+    by_id = {int(s["id"]): s for s in slots}
+    if sid not in by_id or not Database.slot_row_is_active(by_id[sid]["is_active"]):
+        await callback.answer("Этот час недоступен", show_alert=True)
+        return
+    raw = data.get("rs_selected_slot_ids") or []
+    selected = {int(x) for x in raw}
+    if sid in selected:
+        selected.discard(sid)
+    else:
+        selected.add(sid)
+    stable_ids = sorted(int(x) for x in selected)
+    await state.update_data(rs_selected_slot_ids=stable_ids)
+    await _edit(
+        callback.message,
+        _rs_slots_caption(day, len(selected), need),
+        reply_markup=slots_rs_pick_kb(slots, set(stable_ids)),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "rs_slot_confirm", BookingStates.reschedule_pick_slot)
+async def reschedule_slot_confirm(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    day = data.get("rs_day")
+    need = int(data.get("rs_hours") or 1)
+    bid = int(data.get("rs_bid") or 0)
+    raw = data.get("rs_selected_slot_ids") or []
+    if not day or not bid:
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    if len(raw) != need:
+        await callback.answer(f"Нужно выбрать ровно {need} час(ов) подряд.", show_alert=True)
+        return
+    slots = await db.get_all_slots_for_day(day)
+    id_set = {int(x) for x in raw}
+    chosen = [s for s in slots if int(s["id"]) in id_set]
+    if len(chosen) != need:
+        await callback.answer("Часть слотов недоступна", show_alert=True)
+        return
+    if any(not Database.slot_row_is_active(s["is_active"]) for s in chosen):
+        await callback.answer("Часть часов уже занята", show_alert=True)
+        return
+    if not Database.selection_is_valid_multihour_slot_chain(slots, id_set, chosen):
+        await callback.answer("Выберите только соседние часы подряд.", show_alert=True)
+        return
+    chosen_sorted = sorted(
+        chosen,
+        key=lambda s: Database.time_sort_key(Database._coerce_cell_str(s["start_time"])),
+    )
+    slot_text = f"{chosen_sorted[0]['start_time']} — {chosen_sorted[-1]['end_time']}"
+    ids_ordered = [int(s["id"]) for s in chosen_sorted]
+    await state.update_data(rs_new_day=day, rs_new_slot_ids=ids_ordered)
+    preview = (
+        f"<b>Перенос записи #{bid}</b>\n\n"
+        f"<b>Новая дата:</b> {html_escape(day)}\n"
+        f"<b>Новое время:</b> {html_escape(slot_text)}\n\n"
+        "Запрос уйдёт оператору на подтверждение."
+    )
+    await _edit(
+        callback.message,
+        preview,
+        reply_markup=reschedule_confirm_kb(bid),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "rscal:back", BookingStates.reschedule_pick_slot)
+async def reschedule_slot_back_calendar(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    data = await state.get_data()
+    y = int(data.get("cal_year") or now_month()[0])
+    m = int(data.get("cal_month") or now_month()[1])
+    eng = bool(data.get("rs_engineer"))
+    await state.set_state(BookingStates.reschedule_pick_date)
+    await state.update_data(rs_selected_slot_ids=[], rs_day=None)
+    available_days = set(await db.get_available_days(days_ahead=60))
+    blocked: set[str] = set()
+    if eng:
+        from datetime import datetime as _dt
+
+        for d in list(available_days):
+            wd = _dt.fromisoformat(d).weekday()
+            if wd in (5, 6):
+                blocked.add(d)
+        available_days = {d for d in available_days if d not in blocked}
+    closed_admin = await db.get_closed_days_in_month(y, m)
+    await _edit(
+        callback.message,
+        "<b>📅 Выберите новую дату</b>",
+        reply_markup=month_calendar_kb(
+            y,
+            m,
+            allowed_days=available_days,
+            blocked_days=blocked | closed_admin,
+            prefix="rsdate",
+            nav_prefix="rscal",
+            nav_back_callback="book:rsc:quit",
+            nav_back_text="⬅ Отмена",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book:rsc:abort:"))
+async def reschedule_abort_confirm(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    await state.clear()
+    rows = await db.get_user_active_bookings(callback.from_user.id)
+    if not rows:
+        await _present_my_bookings_message(callback, "Активных заявок нет.", main_menu_kb())
+        await callback.answer()
+        return
+    addr = await studio_address_html(db)
+    text = _format_my_bookings_screen(rows, config, studio_address_html=addr)
+    has_studio = any((b.get("booking_kind") or "studio") == "studio" for b in rows)
+    await _present_my_bookings_message(
+        callback, text, my_bookings_kb(rows, show_directions=has_studio)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "book:rsc:quit")
+async def reschedule_quit(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
+    await state.clear()
+    rows = await db.get_user_active_bookings(callback.from_user.id)
+    if not rows:
+        await _present_my_bookings_message(callback, "Активных заявок нет.", main_menu_kb())
+        await callback.answer()
+        return
+    addr = await studio_address_html(db)
+    text = _format_my_bookings_screen(rows, config, studio_address_html=addr)
+    has_studio = any((b.get("booking_kind") or "studio") == "studio" for b in rows)
+    await _present_my_bookings_message(
+        callback, text, my_bookings_kb(rows, show_directions=has_studio)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book:rsc:send:"))
+async def reschedule_request_send(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    config: Config,
+) -> None:
+    booking_id = int(callback.data.split(":")[3])
+    data = await state.get_data()
+    if int(data.get("rs_bid") or 0) != booking_id:
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    new_day = data.get("rs_new_day")
+    new_ids = data.get("rs_new_slot_ids") or []
+    if not new_day or not new_ids:
+        await callback.answer("Сначала выберите дату и время.", show_alert=True)
+        return
+    booking = await db.get_booking_by_id(booking_id)
+    if not booking or booking["user_id"] != callback.from_user.id:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    row = await db.request_user_reschedule(
+        booking_id,
+        callback.from_user.id,
+        new_day=str(new_day),
+        new_slot_ids=[int(x) for x in new_ids],
+    )
+    if not row:
+        await callback.answer(
+            "Не удалось оформить запрос (слоты могли занять). Попробуйте снова.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    s = await db.get_all_settings()
+    inbox = effective_payments_inbox_chat_id(s, config)
+
+    meta = json.loads(row.get("pending_meta") or "{}")
+    st = meta.get("slot_text", "—")
+    client_tg = _format_tg_username(booking.get("tg_username"))
+    admin_text = (
+        "<b>📅 Запрос на перенос записи</b>\n\n"
+        f"<b>ID:</b> <code>#{booking_id}</code>\n"
+        f"<b>Клиент:</b> {html_escape(str(booking['user_name']))}\n"
+        f"<b>Telegram:</b> {html_escape(client_tg or '—')}\n"
+        f"<b>Было:</b> {html_escape(str(booking['day']))} "
+        f"{html_escape(str(booking['start_time']))}—{html_escape(str(booking['end_time']))}\n"
+        f"<b>Станет:</b> {html_escape(str(new_day))} {html_escape(st)}\n"
+        f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
+        f"<b>Сумма:</b> {booking['total_price']} руб"
+    )
+    try:
+        await callback.bot.send_message(
+            inbox,
+            admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_reschedule_review_kb(booking_id),
+        )
+    except Exception:
+        await callback.bot.send_message(
+            config.admin_id,
+            admin_text + "\n\n<i>(не удалось отправить в чат заявок)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_reschedule_review_kb(booking_id),
+        )
+    wait = await append_manager_contact_html(
+        db,
+        "<b>⏳ Запрос на перенос отправлен</b>\n\n"
+        "Ожидайте решения оператора.",
+    )
+    chat_id = callback.message.chat.id
+    wait_mid = callback.message.message_id
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(
+                caption=_truncate_html(wait, 1024),
+                reply_markup=None,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await callback.message.edit_text(
+                _truncate_html(wait, 4096),
+                reply_markup=None,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        sent = await callback.message.answer(wait, parse_mode=ParseMode.HTML)
+        wait_mid = sent.message_id
+        chat_id = sent.chat.id
+    await db.update_booking_client_cleanup(
+        booking_id,
+        json.dumps(
+            {"chat_id": chat_id, "root": wait_mid, "extra": []},
+            ensure_ascii=False,
+        ),
+    )
+    await callback.answer("Запрос отправлен")
 
 
 @router.callback_query(F.data == "noop")

@@ -104,6 +104,31 @@ async def studio_directions_video_file_id(db: Database) -> str:
     return (s.get("studio_directions_video_file_id") or "").strip()
 
 
+async def manager_contact_html(db: Database) -> str:
+    """HTML блок контакта менеджера (подсказки клиенту)."""
+    s = await db.get_all_settings()
+    return (s.get("manager_contact_html") or "").strip()
+
+
+async def cancel_refund_warning_html(db: Database, cfg: Config | None = None) -> str:
+    s = await db.get_all_settings()
+    raw = (s.get("cancel_refund_warning_html") or "").strip()
+    if raw:
+        return raw
+    if cfg is not None:
+        from services.effective_pricing import build_default_settings_dict
+
+        return (build_default_settings_dict(cfg).get("cancel_refund_warning_html") or "").strip()
+    return ""
+
+
+async def append_manager_contact_html(db: Database, text: str) -> str:
+    m = await manager_contact_html(db)
+    if not m:
+        return text
+    return f"{text}\n\n{m}"
+
+
 async def post_payment_contact_block_html(db: Database, cfg: Config, *, kind: str) -> str:
     s = await db.get_all_settings()
     key = "postpay_lyrics_html" if kind == "lyrics" else "postpay_beat_html"
