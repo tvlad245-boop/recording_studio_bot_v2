@@ -780,6 +780,9 @@ async def admin_cancel_booking(
         await message.answer("Активная запись с таким ID не найдена.")
         return
     await reminder_service.remove_for_booking(booking_id)
+    kind = booking.get("booking_kind") or "studio"
+    if kind in (None, "studio"):
+        await _publish_weekly_and_tasks(message.bot, db, config)
     try:
         await message.bot.send_message(booking["user_id"], f"Ваша запись #{booking_id} была отменена администратором.")
     except Exception:
@@ -1528,6 +1531,7 @@ async def payment_reject(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
+        await _publish_weekly_and_tasks(callback.bot, db, config)
     pay_reject = (
         "<b>Оплата не подтверждена</b>\n\n"
         "Если вы уже перевели средства, напишите администратору. "
@@ -1584,6 +1588,7 @@ async def user_cancellation_approve(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.remove_for_booking(bid)
+        await _publish_weekly_and_tasks(callback.bot, db, config)
     lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
     warn = await cancel_refund_warning_html(db, config)
     if Database.booking_time_started(snap, timezone=config.timezone) and warn:
