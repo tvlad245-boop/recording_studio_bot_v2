@@ -373,6 +373,12 @@ async def finalize_confirmed_payment(
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.schedule_for_booking(row)
+    # Канал расписания — сразу после фиксации данных в БД, до сводки/видео:
+    # иначе ошибка в _upsert_user_success_summary или directions могла не дать обновить чат.
+    try:
+        await _publish_weekly_and_tasks(bot, db, cfg)
+    except Exception:
+        pass
     uid = int(row["user_id"])
     chat_id = uid
     if kind in ("lyrics", "beat"):
@@ -411,7 +417,6 @@ async def finalize_confirmed_payment(
     )
     if kind in (None, "studio"):
         await _send_studio_directions_to_user(bot, db, uid)
-    await _publish_weekly_and_tasks(bot, db, cfg)
     return True, "ok"
 
 
