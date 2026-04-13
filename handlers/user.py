@@ -93,6 +93,14 @@ def _truncate_html(text: str, limit: int) -> str:
     return t[:cut].rstrip() + "…"
 
 
+def _yookassa_pay_url_kb(url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 Перейти к оплате", url=url)
+    kb.button(text="⬅ В меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 async def _send_studio_directions_to_user(bot: Bot, db: Database, user_id: int) -> None:
     """После подтверждения оплаты — отдельное видео с подписью (адрес в подписи, если задан)."""
     vid = await studio_directions_video_file_id(db)
@@ -2104,12 +2112,13 @@ async def paid(
                 "\n\n<i>Клиент оплачивает через ЮKassa — после оплаты заявка подтвердится автоматически.</i>"
             )
             try:
-                pay_url = create_payment(
+                pay_url = await create_payment(
                     int(data.get("total", 0)),
                     f"{svc_title} #{order_id}",
                     callback.from_user.id,
                     {"booking_id": order_id},
                     config=config,
+                    db=db,
                 )
             except Exception:
                 logger.exception("YooKassa create_payment failed order_id=%s", order_id)
@@ -2132,17 +2141,38 @@ async def paid(
                     admin_text + "\n\n<i>(не удалось отправить в PAYMENTS_CHAT_ID)</i>",
                     parse_mode=ParseMode.HTML,
                 )
-            await callback.bot.send_message(
-                chat_id,
-                "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)]
-                    ]
-                ),
+            # Не отправляем новое сообщение: обновляем существующий экран оплаты.
+            waiting = await append_manager_contact_html(
+                db,
+                "<b>⏳ Ожидайте</b>\n\n"
+                "Нажмите кнопку ниже и завершите оплату на странице ЮKassa. "
+                "После успешной оплаты заявка подтвердится автоматически.",
+                config,
             )
-            await _edit_waiting_yk()
+            if root_mid:
+                try:
+                    await _edit_payment_screen_message(
+                        callback.bot,
+                        chat_id=chat_id,
+                        message_id=int(root_mid),
+                        text=waiting,
+                        reply_markup=_yookassa_pay_url_kb(pay_url),
+                        is_photo=is_photo,
+                    )
+                except Exception:
+                    await callback.bot.send_message(
+                        chat_id,
+                        "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_yookassa_pay_url_kb(pay_url),
+                    )
+            else:
+                await callback.bot.send_message(
+                    chat_id,
+                    "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_yookassa_pay_url_kb(pay_url),
+                )
             try:
                 await _publish_weekly_and_tasks(callback.bot, db, config)
             except Exception:
@@ -2216,12 +2246,13 @@ async def paid(
             "\n\n<i>Клиент оплачивает через ЮKassa — после оплаты заявка подтвердится автоматически.</i>"
         )
         try:
-            pay_url = create_payment(
+            pay_url = await create_payment(
                 int(data["total"]),
                 f"Запись на студию #{booking_id}",
                 callback.from_user.id,
                 {"booking_id": booking_id},
                 config=config,
+                db=db,
             )
         except Exception:
             logger.exception("YooKassa create_payment failed booking_id=%s", booking_id)
@@ -2244,17 +2275,37 @@ async def paid(
                 admin_text + "\n\n<i>(не удалось отправить в PAYMENTS_CHAT_ID)</i>",
                 parse_mode=ParseMode.HTML,
             )
-        await callback.bot.send_message(
-            chat_id,
-            "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)]
-                ]
-            ),
+        waiting = await append_manager_contact_html(
+            db,
+            "<b>⏳ Ожидайте</b>\n\n"
+            "Нажмите кнопку ниже и завершите оплату на странице ЮKassa. "
+            "После успешной оплаты заявка подтвердится автоматически.",
+            config,
         )
-        await _edit_waiting_yk()
+        if root_mid:
+            try:
+                await _edit_payment_screen_message(
+                    callback.bot,
+                    chat_id=chat_id,
+                    message_id=int(root_mid),
+                    text=waiting,
+                    reply_markup=_yookassa_pay_url_kb(pay_url),
+                    is_photo=is_photo,
+                )
+            except Exception:
+                await callback.bot.send_message(
+                    chat_id,
+                    "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_yookassa_pay_url_kb(pay_url),
+                )
+        else:
+            await callback.bot.send_message(
+                chat_id,
+                "<b>Оплата ЮKassa</b>\n\nНажмите кнопку ниже — откроется страница оплаты.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_yookassa_pay_url_kb(pay_url),
+            )
         try:
             await _publish_weekly_and_tasks(callback.bot, db, config)
         except Exception:
@@ -2572,8 +2623,7 @@ async def cancel_request_send(
         await callback.answer("Не удалось отправить запрос.", show_alert=True)
         return
     await state.clear()
-    s = await db.get_all_settings()
-    inbox = effective_payments_inbox_chat_id(s, config)
+    # Сначала быстро отвечаем пользователю (без ожидания отправки в админ-чат).
     client_tg = _format_tg_username(booking.get("tg_username"))
     if bk in ("lyrics", "beat"):
         notes = (booking.get("notes") or "").strip().replace("\n", " ")
@@ -2598,20 +2648,6 @@ async def cancel_request_send(
             f"<b>Время:</b> {html_escape(str(booking['start_time']))} — {html_escape(str(booking['end_time']))}\n"
             f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
             f"<b>Сумма:</b> {booking['total_price']} руб"
-        )
-    try:
-        await callback.bot.send_message(
-            inbox,
-            admin_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=_cancellation_review_kb(booking_id),
-        )
-    except Exception:
-        await callback.bot.send_message(
-            config.admin_id,
-            admin_text + "\n\n<i>(не удалось отправить в чат заявок)</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_cancellation_review_kb(booking_id),
         )
     wait_tail = (
         "Ожидайте решения оператора."
@@ -2650,6 +2686,30 @@ async def cancel_request_send(
         ),
     )
     await callback.answer("Запрос отправлен")
+
+    # Отправка оператору — в фоне, чтобы кнопка «отмена» отвечала мгновенно.
+    async def _notify_admin_cancel_request() -> None:
+        try:
+            s = await db.get_all_settings()
+            inbox = effective_payments_inbox_chat_id(s, config)
+            await callback.bot.send_message(
+                inbox,
+                admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_cancellation_review_kb(booking_id),
+            )
+        except Exception:
+            try:
+                await callback.bot.send_message(
+                    config.admin_id,
+                    admin_text + "\n\n<i>(не удалось отправить в чат заявок)</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_cancellation_review_kb(booking_id),
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_notify_admin_cancel_request())
 
 
 def _rs_slots_caption(day: str, n_selected: int, need: int) -> str:

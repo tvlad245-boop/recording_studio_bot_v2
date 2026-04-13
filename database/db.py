@@ -121,6 +121,20 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                -- ЮKassa: хранение связи payment_id → booking_id/user_id (переживает перезапуски)
+                CREATE TABLE IF NOT EXISTS yookassa_payment_links (
+                    payment_id TEXT PRIMARY KEY,
+                    booking_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                -- Идемпотентность webhook: если событие пришло повторно, не обрабатываем второй раз
+                CREATE TABLE IF NOT EXISTS yookassa_processed_payments (
+                    payment_id TEXT PRIMARY KEY,
+                    processed_at TEXT NOT NULL
+                );
                 """
             )
             await db.commit()
@@ -228,6 +242,68 @@ class Database:
             for k in ("schedule_week_7d", "tasks_lyrics", "tasks_beat"):
                 await db.execute("DELETE FROM bot_messages WHERE key = ?", (k,))
             await db.commit()
+
+    # --- ЮKassa (персистентность + идемпотентность) ---
+
+    async def upsert_yookassa_payment_link(self, payment_id: str, booking_id: int, user_id: int) -> None:
+        """payment_id → booking_id/user_id (создаётся при Payment.create)."""
+        pid = (payment_id or "").strip()
+        if not pid:
+            return
+        async with self.connect() as db:
+            self._configure(db)
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO yookassa_payment_links(payment_id, booking_id, user_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (pid, int(booking_id), int(user_id), now),
+            )
+            await db.commit()
+
+    async def get_yookassa_payment_link(self, payment_id: str) -> dict[str, Any] | None:
+        pid = (payment_id or "").strip()
+        if not pid:
+            return None
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                "SELECT payment_id, booking_id, user_id, created_at FROM yookassa_payment_links WHERE payment_id = ?",
+                (pid,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def delete_yookassa_payment_link(self, payment_id: str) -> None:
+        pid = (payment_id or "").strip()
+        if not pid:
+            return
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("DELETE FROM yookassa_payment_links WHERE payment_id = ?", (pid,))
+            await db.commit()
+
+    async def mark_yookassa_payment_processed(self, payment_id: str) -> bool:
+        """
+        Атомарно помечает payment_id как обработанный.
+        Возвращает True, если это первая обработка; False — если уже было обработано раньше.
+        """
+        pid = (payment_id or "").strip()
+        if not pid:
+            return False
+        async with self.connect() as db:
+            self._configure(db)
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            try:
+                await db.execute(
+                    "INSERT INTO yookassa_processed_payments(payment_id, processed_at) VALUES (?, ?)",
+                    (pid, now),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
 
     async def get_user_activity_message(self, user_id: int) -> dict[str, Any] | None:
         """Одно «липкое» сообщение пользователя: накопление успешных заявок."""

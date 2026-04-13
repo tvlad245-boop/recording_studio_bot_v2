@@ -5,6 +5,7 @@ FastAPI: webhook ЮKassa. Тот же процесс, что и aiogram — ко
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -16,6 +17,10 @@ from services.yookassa_payments import payments
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Studio bot — YooKassa webhook")
+
+# Опциональная защита webhook простым токеном.
+# Если переменная задана — ожидаем заголовок X-Webhook-Token: <token>
+_WEBHOOK_TOKEN = (os.getenv("WEBHOOK_TOKEN", "").strip() or os.getenv("WEBHOOK_SECRET", "").strip())
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
@@ -63,10 +68,12 @@ async def _log_all_requests(request: Request, call_next):
             hv = request.headers.get(hk)
             if hv:
                 logger.warning("WEBHOOK HDR %s: %s", hk, hv)
-        if preview:
-            logger.warning("WEBHOOK RAW BODY (preview): %s", preview)
-        else:
-            logger.warning("WEBHOOK RAW BODY (empty)")
+        # Сырой body логируем только для POST — иначе будет слишком шумно
+        if request.method.upper() == "POST":
+            if preview:
+                logger.warning("WEBHOOK RAW BODY (preview): %s", preview)
+            else:
+                logger.warning("WEBHOOK RAW BODY (empty)")
 
     resp = await call_next(request)
 
@@ -112,6 +119,11 @@ def _safe_preview(body: dict) -> dict:
 
 @app.post("/yookassa-webhook")
 async def yookassa_webhook(request: Request) -> JSONResponse:
+    if _WEBHOOK_TOKEN:
+        got = (request.headers.get("x-webhook-token") or "").strip()
+        if got != _WEBHOOK_TOKEN:
+            logger.warning("WEBHOOK TOKEN MISMATCH")
+            return JSONResponse({"ok": False}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -175,17 +187,33 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         logger.error("Webhook context is not initialized")
         return JSONResponse({"ok": False}, status_code=503)
 
+    # Идемпотентность: повторный webhook по тому же payment_id пропускаем
+    try:
+        first = await db.mark_yookassa_payment_processed(pid)
+    except Exception:
+        logger.exception("Failed to mark payment processed payment_id=%s", pid)
+        first = True
+    if not first:
+        logger.warning("Duplicate webhook ignored payment_id=%s", pid)
+        return JSONResponse({"ok": True})
+
+    # Если metadata/RAM не дали booking_id или user_id — пробуем SQLite (переживает рестарты)
+    if not booking_id or not user_id:
+        try:
+            link = await db.get_yookassa_payment_link(pid)
+        except Exception:
+            link = None
+        if link:
+            if not booking_id:
+                booking_id = int(link.get("booking_id") or 0)
+            if not user_id:
+                user_id = int(link.get("user_id") or 0)
+            logger.warning("USER FOUND (sqlite)") if user_id else logger.warning("USER NOT FOUND (sqlite)")
+
     if not booking_id:
-        print("ERROR: BOOKING_ID missing; cannot confirm booking")
         logger.warning("YooKassa webhook: missing booking_id for payment %s", pid)
         payments.pop(pid, None)
         return JSONResponse({"ok": True})
-
-    try:
-        # Цель задачи: пользователь получает это сообщение автоматически после оплаты
-        await bot.send_message(user_id, "Оплата прошла, запись подтверждена ✅")
-    except Exception:
-        logger.exception("Failed to notify user %s", user_id)
 
     try:
         ok, _msg = await finalize_confirmed_payment(bot, db, cfg, reminder, booking_id)
@@ -201,6 +229,10 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     payments.pop(pid, None)
+    try:
+        await db.delete_yookassa_payment_link(pid)
+    except Exception:
+        pass
     return JSONResponse({"ok": True})
 
 

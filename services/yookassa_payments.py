@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import uuid
 from html import escape as html_escape
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from config import Config
 
@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 # payment_id (str) → {"user_id": int, "slot": dict}
 payments: dict[str, dict[str, Any]] = {}
+
+if TYPE_CHECKING:
+    from database.db import Database
 
 
 def is_yookassa_configured(config: Config) -> bool:
@@ -32,13 +35,14 @@ def payment_destination_block_html(config: Config) -> str:
     return f"<b>Куда отправить:</b>\n{html_escape(pay)}"
 
 
-def create_payment(
+async def create_payment(
     amount: int,
     description: str,
     user_id: int,
     slot: dict[str, Any],
     *,
     config: Config,
+    db: "Database | None" = None,
 ) -> str:
     """
     Создаёт платёж в ЮKassa, сохраняет payments[payment_id] = {user_id, slot}, возвращает confirmation_url.
@@ -95,5 +99,9 @@ def create_payment(
         raise RuntimeError("YooKassa: no confirmation_url")
 
     payments[str(pid)] = {"user_id": int(user_id), "slot": dict(slot)}
+    if db is not None:
+        bid = int(slot.get("booking_id") or 0)
+        if bid:
+            await db.upsert_yookassa_payment_link(str(pid), bid, int(user_id))
     logger.info("YooKassa payment created id=%s user_id=%s", pid, user_id)
     return str(url)
