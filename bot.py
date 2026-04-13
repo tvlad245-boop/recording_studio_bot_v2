@@ -29,6 +29,8 @@ async def _run_yookassa_uvicorn(host: str, port: int) -> None:
         access_log=True,
         proxy_headers=True,
         forwarded_allow_ips="*",
+        # Не перехватывать SIGINT/SIGTERM: иначе при Ctrl+C uvicorn дублирует сигнал и сыпятся лишние traceback'и рядом с polling.
+        install_signal_handlers=False,
     )
     server = uvicorn.Server(config)
     await server.serve()
@@ -76,6 +78,14 @@ async def main() -> None:
         bot=bot, db=db, cfg=cfg, reminder_service=reminder_service
     )
 
+    # Снять webhook, если раньше бот работал через webhook — иначе long polling не стартует.
+    await bot.delete_webhook(drop_pending_updates=False)
+    _log.info(
+        "Запуск long polling. Если в логах «Conflict: other getUpdates» — с тем же токеном уже "
+        "крутится другой процесс (вторая консоль, VPS, systemd, PM2, тест на другой машине). "
+        "Остановите лишние копии; один бот = один активный polling."
+    )
+
     async def _polling() -> None:
         await dp.start_polling(bot, config=cfg, db=db, reminder_service=reminder_service)
 
@@ -96,5 +106,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
 
