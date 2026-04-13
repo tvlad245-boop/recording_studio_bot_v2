@@ -17,6 +17,31 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Studio bot — YooKassa webhook")
 
+@app.middleware("http")
+async def _log_all_requests(request: Request, call_next):
+    """
+    Bothost может не показывать print() в логах стабильно.
+    Поэтому дополнительно логируем вход на /yookassa-webhook через logging.
+    """
+    try:
+        raw = await request.body()
+        preview = raw[:2000].decode("utf-8", errors="replace") if raw else ""
+    except Exception as e:
+        preview = f"<failed to read body: {e}>"
+
+    if request.url.path.startswith("/yookassa-webhook"):
+        logger.warning("WEBHOOK RECEIVED %s %s", request.method, request.url.path)
+        if preview:
+            logger.warning("WEBHOOK RAW BODY (preview): %s", preview)
+        else:
+            logger.warning("WEBHOOK RAW BODY (empty)")
+
+    resp = await call_next(request)
+
+    if request.url.path.startswith("/yookassa-webhook"):
+        logger.warning("WEBHOOK RESP STATUS: %s", getattr(resp, "status_code", "?"))
+    return resp
+
 
 @app.get("/yookassa-webhook")
 async def yookassa_webhook_ping() -> dict[str, str]:
@@ -61,34 +86,34 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     # --- подробные логи для отладки ---
-    print("WEBHOOK RECEIVED")
+    logger.warning("WEBHOOK RECEIVED")
     try:
-        print("WEBHOOK BODY:", _safe_preview(body))
+        logger.warning("WEBHOOK BODY: %s", _safe_preview(body))
     except Exception:
-        print("WEBHOOK BODY: <failed to preview>")
+        logger.warning("WEBHOOK BODY: <failed to preview>")
 
     ev = body.get("event")
-    print("EVENT:", ev)
+    logger.warning("EVENT: %s", ev)
     if ev != "payment.succeeded":
         return JSONResponse({"ok": True})
 
     obj = body.get("object") or {}
     payment_id = obj.get("id")
-    print("PAYMENT ID:", payment_id)
+    logger.warning("PAYMENT ID: %s", payment_id)
     if not payment_id:
-        print("PAYMENT ID: <missing>")
+        logger.warning("PAYMENT ID: <missing>")
         logger.warning("YooKassa webhook: payment.succeeded without object.id")
         return JSONResponse({"ok": True})
 
     pid = str(payment_id)
     # 1) Сначала пробуем из metadata (надёжнее: не зависит от RAM)
     u_meta, b_meta = _parse_webhook_meta(obj)
-    print("METADATA:", obj.get("metadata"))
+    logger.warning("METADATA: %s", obj.get("metadata"))
     user_id = int(u_meta or 0)
     booking_id = int(b_meta or 0)
 
     if not user_id or not booking_id:
-        print("METADATA ERROR: user_id or booking_id is missing/empty")
+        logger.warning("METADATA ERROR: user_id or booking_id is missing/empty")
 
         # 2) Если metadata нет/пустая — пробуем локальное хранилище payments
         meta = payments.get(pid) or {}
@@ -104,9 +129,9 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
                 booking_id = 0
 
     if user_id:
-        print("USER FOUND")
+        logger.warning("USER FOUND")
     else:
-        print("USER NOT FOUND")
+        logger.warning("USER NOT FOUND")
 
     bot = get_bot()
     db = get_db()
@@ -114,7 +139,7 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
     reminder = get_reminder_service()
 
     if not bot or not db or not cfg or not reminder:
-        print("ERROR: webhook context is not initialized")
+        logger.error("ERROR: webhook context is not initialized")
         logger.error("Webhook context is not initialized")
         return JSONResponse({"ok": False}, status_code=503)
 
