@@ -473,8 +473,7 @@ class Database:
     async def apply_standard_schedule_to_month(self, year: int, month: int) -> int:
         """
         Проставляет стандартную почасовую сетку на все дни месяца, начиная с сегодня.
-        Пропускает прошлые даты и дни, закрытые через «Открыть/закрыть день».
-        Возвращает число дней, для которых вызывался add_work_day.
+        Дни, закрытые через «Открыть/закрыть день», сначала открываются (open_work_day), затем сетка.
         """
         today = date.today()
         _, dim = monthrange(year, month)
@@ -485,8 +484,9 @@ class Database:
                 continue
             iso = d.isoformat()
             if await self.is_work_day_closed(iso):
-                continue
-            await self.add_work_day(iso)
+                await self.open_work_day(iso)
+            else:
+                await self.add_work_day(iso)
             touched += 1
         return touched
 
@@ -586,6 +586,24 @@ class Database:
         lst = sorted(days)
         ex = await self.get_engineer_exceptions_bulk(lst)
         return {d for d in lst if Database.engineer_effective_works(d, ex.get(d))}
+
+    async def get_engineer_unavailable_days_in_month(self, year: int, month: int) -> set[str]:
+        """Даты месяца (не раньше сегодня), когда со звукорежиссёром записаться нельзя (сб/вс и исключения)."""
+        _, dim = monthrange(year, month)
+        today_iso = date.today().isoformat()
+        month_isos: list[str] = []
+        for dn in range(1, dim + 1):
+            iso = date(year, month, dn).isoformat()
+            if iso >= today_iso:
+                month_isos.append(iso)
+        if not month_isos:
+            return set()
+        ex = await self.get_engineer_exceptions_bulk(month_isos)
+        return {
+            iso
+            for iso in month_isos
+            if not Database.engineer_effective_works(iso, ex.get(iso))
+        }
 
     async def toggle_engineer_day_exception(self, day: str) -> None:
         """
