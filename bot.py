@@ -26,6 +26,9 @@ async def _run_yookassa_uvicorn(host: str, port: int) -> None:
         host=host,
         port=port,
         log_level="info",
+        access_log=True,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
     server = uvicorn.Server(config)
     await server.serve()
@@ -79,7 +82,8 @@ async def main() -> None:
     try:
         if cfg.yookassa_shop_id and cfg.yookassa_secret_key:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
-            wh_port = int(os.getenv("WEBHOOK_PORT", "8080"))
+            # Bothost/PAAS часто задаёт порт через переменную PORT.
+            wh_port = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")))
             await asyncio.gather(
                 _polling(),
                 _run_yookassa_uvicorn(wh_host, wh_port),

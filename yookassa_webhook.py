@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Studio bot — YooKassa webhook")
 
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
 @app.middleware("http")
 async def _log_all_requests(request: Request, call_next):
     """
