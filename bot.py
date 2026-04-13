@@ -29,8 +29,6 @@ async def _run_yookassa_uvicorn(host: str, port: int) -> None:
         access_log=True,
         proxy_headers=True,
         forwarded_allow_ips="*",
-        # Не перехватывать SIGINT/SIGTERM: иначе при Ctrl+C uvicorn дублирует сигнал и сыпятся лишние traceback'и рядом с polling.
-        install_signal_handlers=False,
     )
     server = uvicorn.Server(config)
     await server.serve()
