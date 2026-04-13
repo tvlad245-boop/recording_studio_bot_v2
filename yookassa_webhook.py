@@ -40,45 +40,32 @@ async def root() -> dict[str, str]:
     }
 
 @app.middleware("http")
-async def _log_all_requests(request: Request, call_next):
+async def _log_webhook_request(request: Request, call_next):
     """
-    Bothost может не показывать print() в логах стабильно.
-    Поэтому дополнительно логируем вход на /yookassa-webhook через logging.
+    Короткая отметка о запросах к webhook-маршрутам.
+    Тело не читаем здесь — его парсит обработчик POST; иначе лишняя работа и риск
+    конфликтов при чтении потока на некоторых стеках.
     """
-    try:
-        raw = await request.body()
-        preview = raw[:2000].decode("utf-8", errors="replace") if raw else ""
-    except Exception as e:
-        preview = f"<failed to read body: {e}>"
-
-    # Логируем всё, что приходит на webhook-роуты (и на '/', если хостинг режет path).
-    is_webhookish = request.url.path in ("/yookassa-webhook", "/") or request.url.path.startswith(
-        "/yookassa-webhook"
-    )
+    path = request.url.path
+    is_webhookish = path in ("/yookassa-webhook", "/") or path.startswith("/yookassa-webhook")
     if is_webhookish:
-        logger.warning("WEBHOOK RECEIVED %s %s", request.method, request.url.path)
-        # Иногда прокси передаёт оригинальный URL в заголовках — полезно увидеть.
-        for hk in (
-            "x-original-uri",
-            "x-forwarded-uri",
-            "x-rewrite-url",
-            "x-forwarded-proto",
-            "x-forwarded-host",
-        ):
-            hv = request.headers.get(hk)
-            if hv:
-                logger.warning("WEBHOOK HDR %s: %s", hk, hv)
-        # Сырой body логируем только для POST — иначе будет слишком шумно
-        if request.method.upper() == "POST":
-            if preview:
-                logger.warning("WEBHOOK RAW BODY (preview): %s", preview)
-            else:
-                logger.warning("WEBHOOK RAW BODY (empty)")
+        logger.info("WEBHOOK %s %s", request.method, path)
+        if logger.isEnabledFor(logging.DEBUG):
+            for hk in (
+                "x-original-uri",
+                "x-forwarded-uri",
+                "x-rewrite-url",
+                "x-forwarded-proto",
+                "x-forwarded-host",
+            ):
+                hv = request.headers.get(hk)
+                if hv:
+                    logger.debug("WEBHOOK HDR %s: %s", hk, hv)
 
     resp = await call_next(request)
 
-    if is_webhookish:
-        logger.warning("WEBHOOK RESP STATUS: %s", getattr(resp, "status_code", "?"))
+    if is_webhookish and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("WEBHOOK RESP %s", getattr(resp, "status_code", "?"))
     return resp
 
 

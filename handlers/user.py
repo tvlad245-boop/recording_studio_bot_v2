@@ -83,6 +83,7 @@ from services.yookassa_payments import (
     create_payment,
     is_yookassa_configured,
     payment_destination_block_html,
+    pop_yookassa_payments_for_booking,
 )
 from states import BookingStates
 
@@ -1175,6 +1176,21 @@ async def booking_start(
 ) -> None:
     await state.clear()
     user_id = callback.from_user.id
+    try:
+        dropped = await db.cancel_all_awaiting_yookassa_for_user(user_id)
+        if dropped:
+            for bid in dropped:
+                pop_yookassa_payments_for_booking(bid)
+            try:
+                await _publish_weekly_and_tasks(callback.bot, db, config)
+            except Exception:
+                logger.exception(
+                    "_publish_weekly_and_tasks after cancel awaiting_yookassa uid=%s bids=%s",
+                    user_id,
+                    dropped,
+                )
+    except Exception:
+        logger.exception("cancel_all_awaiting_yookassa_for_user uid=%s", user_id)
     await state.update_data(root_message_id=callback.message.message_id)
     await state.update_data(tg_username=callback.from_user.username or "")
 

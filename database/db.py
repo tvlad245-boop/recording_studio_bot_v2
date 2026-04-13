@@ -993,6 +993,41 @@ class Database:
             await db.commit()
             return booking
 
+    async def delete_yookassa_payment_links_for_booking(self, booking_id: int) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute(
+                "DELETE FROM yookassa_payment_links WHERE booking_id = ?",
+                (int(booking_id),),
+            )
+            await db.commit()
+
+    async def cancel_all_awaiting_yookassa_for_user(self, user_id: int) -> list[int]:
+        """
+        Отменяет все заявки пользователя в awaiting_yookassa (брошенная оплата).
+        Не зависит от FSM — нужно при нескольких воркерах / после «В меню» без состояния.
+        """
+        uid = int(user_id)
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                """
+                SELECT id FROM bookings
+                WHERE user_id = ? AND status = 'awaiting_yookassa'
+                ORDER BY id ASC
+                """,
+                (uid,),
+            )
+            rows = await cur.fetchall()
+        cancelled: list[int] = []
+        for r in rows:
+            bid = int(r["id"])
+            row = await self.cancel_booking(bid)
+            if row:
+                await self.delete_yookassa_payment_links_for_booking(bid)
+                cancelled.append(bid)
+        return cancelled
+
     async def confirm_booking_payment(self, booking_id: int) -> dict[str, Any] | None:
         """pending_payment / awaiting_yookassa → active. Возвращает строку брони или None."""
         async with self.connect() as db:

@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 # payment_id (str) → {"user_id": int, "slot": dict}
 payments: dict[str, dict[str, Any]] = {}
 
+
+def pop_yookassa_payments_for_booking(booking_id: int) -> None:
+    """Удаляет записи в RAM по booking_id (после отмены брошенной оплаты)."""
+    bid = int(booking_id)
+    for pid, meta in list(payments.items()):
+        slot = meta.get("slot") or {}
+        try:
+            sb = int(slot.get("booking_id") or 0)
+        except (TypeError, ValueError):
+            sb = 0
+        if sb == bid:
+            payments.pop(pid, None)
+
 if TYPE_CHECKING:
     from database.db import Database
 
