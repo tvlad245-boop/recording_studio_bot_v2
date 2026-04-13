@@ -34,10 +34,20 @@ def tariff_category_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def tariff_day_start_kb() -> InlineKeyboardMarkup:
+def tariff_day_start_kb(times: list[str]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="С 09:00", callback_data="trf:s:09")
-    kb.button(text="С 12:00", callback_data="trf:s:12")
+    for i, t in enumerate(times):
+        kb.button(text=f"С {t}", callback_data=f"trf:s:{i}")
+    kb.button(text="⬅ Назад", callback_data="trf:c:back")
+    kb.button(text="⬅ В меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def tariff_night_start_kb(times: list[str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for i, t in enumerate(times):
+        kb.button(text=f"С {t}", callback_data=f"trf:n:{i}")
     kb.button(text="⬅ Назад", callback_data="trf:c:back")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
@@ -45,7 +55,11 @@ def tariff_day_start_kb() -> InlineKeyboardMarkup:
 
 
 def tariff_hours_kb(
-    *, night: bool, pricing: EffectivePricing, with_engineer: bool = False
+    *,
+    night: bool,
+    pricing: EffectivePricing,
+    with_engineer: bool = False,
+    night_back_callback: str = "trf:c:back",
 ) -> InlineKeyboardMarkup:
     """6 / 8 / 10 / 12 ч с ценами из БД / .env; with_engineer — отдельный прайс со звукорежиссёром."""
     kb = InlineKeyboardBuilder()
@@ -54,7 +68,7 @@ def tariff_hours_kb(
         p = pricing.tariff_rub(night=night, hours=h, with_engineer=with_engineer)
         kb.button(text=f"{h} ч — {p} руб", callback_data=f"trf:h:{h}")
     kb.adjust(2, 2)
-    back_cd = "trf:c:back" if night else "trf:h:back"
+    back_cd = night_back_callback if night else "trf:h:back"
     kb.button(text="⬅ Назад", callback_data=back_cd)
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(2)

@@ -70,6 +70,8 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "cancel_request_sent_html": "",
         "cancel_confirmed_studio_html": "",
         "cancel_confirmed_service_html": "",
+        "tariff_day_start_times": "09:00\n12:00",
+        "tariff_night_start_times": "00:00",
     }
     return d
 

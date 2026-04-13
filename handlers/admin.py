@@ -41,7 +41,8 @@ from services.channel_settings import (
     effective_subscription_channel_id,
     effective_subscription_channel_link,
 )
-from services.effective_pricing import EffectivePricing, load_effective_pricing
+from services.content_settings import tariff_day_start_list, tariff_night_start_list
+from services.effective_pricing import EffectivePricing, build_default_settings_dict, load_effective_pricing
 from services.reminders import ReminderService
 from states import AdminStates
 
@@ -333,6 +334,8 @@ _CHANNEL_EDIT_PROMPTS: dict[str, tuple[str, str, str]] = {
 
 _CHANNEL_SETTING_KEYS = frozenset(v[0] for v in _CHANNEL_EDIT_PROMPTS.values())
 
+_TARIFF_TIME_SETTING_KEYS = frozenset({"tariff_day_start_times", "tariff_night_start_times"})
+
 _CLIENT_TEXT_SETTING_KEYS = frozenset(
     {
         "cancel_refund_warning_html",
@@ -443,6 +446,8 @@ def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
     )
     kb.button(text=f"📝 Текст: {pricing.price_lyrics} ₽", callback_data="admkv:price_lyrics")
     kb.button(text=f"🎚️ Бит: {pricing.price_beat} ₽", callback_data="admkv:price_beat")
+    kb.button(text="☀️ Старты дневного тарифа (времена)", callback_data="admkv:tariff_day_start_times")
+    kb.button(text="🌙 Старты ночного тарифа (времена)", callback_data="admkv:tariff_night_start_times")
     for key, label in [
         ("tariff_night_6h", "🌙6"),
         ("tariff_night_8h", "🌙8"),
@@ -540,7 +545,8 @@ async def admin_actions(
         await state.clear()
         await _admin_edit_panel(
             callback,
-            "<b>💰 Цены</b>\nВыберите позицию, затем введите целое число (руб) в чат.",
+            "<b>💰 Цены</b>\nВыберите позицию, затем введите целое число (руб) в чат.\n"
+            "<i>Стартовые времена дневного и ночного тарифа — отдельными кнопками (формат ЧЧ:ММ).</i>",
             _admin_prices_kb(pricing),
         )
         await callback.answer()
@@ -922,6 +928,41 @@ async def admin_price_key(callback: CallbackQuery, state: FSMContext, config: Co
         await callback.answer("Нет доступа", show_alert=True)
         return
     key = callback.data.split(":", maxsplit=1)[1]
+    if key in _TARIFF_TIME_SETTING_KEYS:
+        hints = {
+            "tariff_day_start_times": (
+                "<b>Старты дневного тарифа</b>\n\n"
+                "По одному времени в строке, формат <code>ЧЧ:ММ</code> (например <code>09:00</code>). "
+                "Можно через запятую или с новой строки. Минимум одно время.\n"
+                "Символ <code>-</code> — сброс к значениям по умолчанию (09:00 и 12:00)."
+            ),
+            "tariff_night_start_times": (
+                "<b>Старты ночного тарифа</b>\n\n"
+                "По одному времени в строке, формат <code>ЧЧ:ММ</code> (часто <code>00:00</code>). "
+                "Несколько вариантов — с новой строки или через запятую.\n"
+                "Символ <code>-</code> — сброс к <code>00:00</code>."
+            ),
+        }
+        await state.set_state(AdminStates.wait_setting_text)
+        await state.update_data(
+            setting_key=key,
+            admin_panel_mid=callback.message.message_id,
+            admin_panel_cid=callback.message.chat.id,
+        )
+        try:
+            await callback.message.edit_text(
+                hints[key],
+                parse_mode=ParseMode.HTML,
+                reply_markup=_admin_abort_kb(),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                hints[key],
+                parse_mode=ParseMode.HTML,
+                reply_markup=_admin_abort_kb(),
+            )
+        await callback.answer()
+        return
     await state.set_state(AdminStates.price_wait_value)
     await state.update_data(
         admin_price_key=key,
@@ -1569,6 +1610,25 @@ async def admin_wait_setting_text(
                 )
                 return
             await db.set_setting(key, clean)
+    elif key in _TARIFF_TIME_SETTING_KEYS:
+        ddef = build_default_settings_dict(config)
+        val = (ddef.get(key) or "").strip() if raw == "-" else raw
+        cur = await db.get_all_settings()
+        merged = dict(cur)
+        merged[key] = val
+        opts = (
+            tariff_day_start_list(merged)
+            if key == "tariff_day_start_times"
+            else tariff_night_start_list(merged)
+        )
+        if not opts:
+            await message.answer(
+                "Нужен хотя бы один корректный формат времени ЧЧ:ММ (например 09:00). "
+                "Несколько значений — с новой строки или через запятую.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await db.set_setting(key, val)
     else:
         val = "" if raw == "-" else raw
         await db.set_setting(key, val)
@@ -1610,6 +1670,16 @@ async def admin_wait_setting_text(
                 int(mid),
                 text=_client_texts_admin_text(),
                 reply_markup=_client_texts_menu_kb(),
+            )
+        elif key in _TARIFF_TIME_SETTING_KEYS:
+            pricing2 = await load_effective_pricing(db, config)
+            await _restore_admin_panel_message(
+                message.bot,
+                int(cid),
+                int(mid),
+                text="<b>💰 Цены</b>\nВыберите позицию, затем введите целое число (руб) в чат.\n"
+                "<i>Стартовые времена дневного и ночного тарифа — отдельными кнопками (формат ЧЧ:ММ).</i>",
+                reply_markup=_admin_prices_kb(pricing2),
             )
         elif key in _CONTACTS_SETTING_KEYS:
             await _restore_admin_panel_message(

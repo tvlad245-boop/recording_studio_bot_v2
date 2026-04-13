@@ -45,6 +45,8 @@ from services.content_settings import (
     manager_contact_html,
     studio_address_html,
     studio_directions_video_file_id,
+    tariff_day_start_list,
+    tariff_night_start_list,
     ui_photo_main_menu,
     ui_photo_payment,
     ui_photo_prices,
@@ -71,6 +73,7 @@ from keyboards import (
     tariff_category_kb,
     tariff_day_start_kb,
     tariff_hours_kb,
+    tariff_night_start_kb,
 )
 from services.effective_pricing import EffectivePricing
 from services.reminders import ReminderService
@@ -281,7 +284,7 @@ async def finalize_confirmed_payment(
     *,
     success_entry_prefix_html: str | None = None,
 ) -> tuple[bool, str]:
-    """pending_payment → active, напоминания, канал, сводка пользователю, уведомление в чат."""
+    """Оплата подтверждена: pending_payment или awaiting_yookassa → active; напоминания, канал, сводка."""
     row = await db.confirm_booking_payment(booking_id)
     if not row:
         return False, "Заявка не найдена или уже обработана"
@@ -1302,13 +1305,15 @@ async def show_studio_mode(
     await state.set_state(BookingStates.choosing_studio_mode)
     await state.update_data(booking_mode=None, tariff_label=None)
     s = await db.get_all_settings()
+    day_lbl = html_escape(", ".join(tariff_day_start_list(s)))
+    night_lbl = html_escape(", ".join(tariff_night_start_list(s)))
     await _edit_screen(
         callback,
         "<b>Запись на студию</b>\n\n"
         "Выберите режим:\n"
         "• <b>Почасовая запись</b> — сами отмечаете нужные часы.\n"
         "• <b>Тарифы</b> — пакеты на 6 / 8 / 10 / 12 ч: "
-        "<b>ночная</b> (с 00:00) или <b>дневная</b> (с 09:00 или 12:00).",
+        f"<b>ночная</b> (старт: {night_lbl}) или <b>дневная</b> (старт: {day_lbl}).",
         studio_mode_kb(),
         photo_path=ui_photo_main_menu(s, config),
     )
@@ -1451,6 +1456,7 @@ async def studio_mode_tariff(
         tariff_kind=None,
         tariff_hours=None,
         tariff_day_start=None,
+        tariff_night_start=None,
         tariff_start=None,
         tariff_label=None,
     )
@@ -1480,18 +1486,29 @@ async def tariff_cat_night(
     db: Database,
     pricing: EffectivePricing,
 ) -> None:
-    await state.update_data(tariff_kind="night")
+    await state.update_data(tariff_kind="night", tariff_night_start=None)
     data = await state.get_data()
     we = data.get("product") == "with_engineer"
     s = await db.get_all_settings()
-    await _edit_screen(
-        callback,
-        "<b>🌙 Ночная запись</b>\n\n"
-        "Интервал с <b>00:00</b> (например 6 ч → 00:00–06:00, 12 ч → 00:00–12:00).\n\n"
-        "Выберите длительность:",
-        tariff_hours_kb(night=True, pricing=pricing, with_engineer=we),
-        photo_path=ui_photo_tariff_night(s, config),
-    )
+    night_times = tariff_night_start_list(s)
+    if len(night_times) == 1:
+        st0 = night_times[0]
+        await state.update_data(tariff_night_start=st0)
+        await _edit_screen(
+            callback,
+            "<b>🌙 Ночная запись</b>\n\n"
+            f"Старт в <b>{html_escape(st0)}</b>. Например: 6 ч — шесть часов подряд с этого времени.\n\n"
+            "Выберите длительность:",
+            tariff_hours_kb(night=True, pricing=pricing, with_engineer=we, night_back_callback="trf:c:back"),
+            photo_path=ui_photo_tariff_night(s, config),
+        )
+    else:
+        await _edit_screen(
+            callback,
+            "<b>🌙 Ночная запись</b>\n\nС какого времени начинается сессия?",
+            tariff_night_start_kb(night_times),
+            photo_path=ui_photo_tariff_night(s, config),
+        )
     await callback.answer()
 
 
@@ -1501,10 +1518,11 @@ async def tariff_cat_day(
 ) -> None:
     await state.update_data(tariff_kind="day")
     s = await db.get_all_settings()
+    day_times = tariff_day_start_list(s)
     await _edit_screen(
         callback,
         "<b>☀️ Дневная запись</b>\n\nС какого времени начинается сессия?",
-        tariff_day_start_kb(),
+        tariff_day_start_kb(day_times),
         photo_path=ui_photo_tariff_day(s, config),
     )
     await callback.answer()
@@ -1533,22 +1551,91 @@ async def tariff_day_start_pick(
     pricing: EffectivePricing,
 ) -> None:
     part = callback.data.split(":")[2]
+    s = await db.get_all_settings()
+    day_times = tariff_day_start_list(s)
+    start: str | None = None
     if part == "09":
         start = "09:00"
     elif part == "12":
         start = "12:00"
     else:
+        try:
+            idx = int(part)
+            if 0 <= idx < len(day_times):
+                start = day_times[idx]
+        except ValueError:
+            pass
+    if not start:
         await callback.answer()
         return
     await state.update_data(tariff_day_start=start)
     data = await state.get_data()
     we = data.get("product") == "with_engineer"
-    s = await db.get_all_settings()
     await _edit_screen(
         callback,
-        f"<b>☀️ Дневная запись</b> (начало в {start})\n\nВыберите длительность:",
+        f"<b>☀️ Дневная запись</b> (начало в {html_escape(start)})\n\nВыберите длительность:",
         tariff_hours_kb(night=False, pricing=pricing, with_engineer=we),
         photo_path=ui_photo_tariff_day(s, config),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("trf:n:"), BookingStates.choosing_tariff)
+async def tariff_night_start_pick(
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
+) -> None:
+    part = callback.data.split(":")[2]
+    try:
+        idx = int(part)
+    except ValueError:
+        await callback.answer()
+        return
+    s = await db.get_all_settings()
+    nts = tariff_night_start_list(s)
+    if idx < 0 or idx >= len(nts):
+        await callback.answer()
+        return
+    start = nts[idx]
+    await state.update_data(tariff_night_start=start)
+    data = await state.get_data()
+    we = data.get("product") == "with_engineer"
+    night_back = "trf:nback" if len(nts) > 1 else "trf:c:back"
+    await _edit_screen(
+        callback,
+        f"<b>🌙 Ночная запись</b> (начало в {html_escape(start)})\n\nВыберите длительность:",
+        tariff_hours_kb(
+            night=True, pricing=pricing, with_engineer=we, night_back_callback=night_back
+        ),
+        photo_path=ui_photo_tariff_night(s, config),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "trf:nback", BookingStates.choosing_tariff)
+async def tariff_night_start_back(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    s = await db.get_all_settings()
+    nts = tariff_night_start_list(s)
+    if len(nts) <= 1:
+        await _edit_screen(
+            callback,
+            "<b>📦 Тарифы</b>\n\nВыберите: ночная или дневная запись.",
+            tariff_category_kb(),
+            photo_path=ui_photo_tariff_category(s, config),
+        )
+        await callback.answer()
+        return
+    await state.update_data(tariff_night_start=None)
+    await _edit_screen(
+        callback,
+        "<b>🌙 Ночная запись</b>\n\nС какого времени начинается сессия?",
+        tariff_night_start_kb(nts),
+        photo_path=ui_photo_tariff_night(s, config),
     )
     await callback.answer()
 
@@ -1558,14 +1645,30 @@ async def tariff_pick_hours(callback: CallbackQuery, state: FSMContext, db: Data
     payload = callback.data.split(":")[2]
     if payload == "back":
         data = await state.get_data()
+        s = await db.get_all_settings()
         if data.get("tariff_kind") == "day":
-            s = await db.get_all_settings()
             await _edit_screen(
                 callback,
                 "<b>☀️ Дневная запись</b>\n\nС какого времени начинается сессия?",
-                tariff_day_start_kb(),
+                tariff_day_start_kb(tariff_day_start_list(s)),
                 photo_path=ui_photo_tariff_day(s, config),
             )
+        elif data.get("tariff_kind") == "night":
+            nts = tariff_night_start_list(s)
+            if len(nts) > 1:
+                await _edit_screen(
+                    callback,
+                    "<b>🌙 Ночная запись</b>\n\nС какого времени начинается сессия?",
+                    tariff_night_start_kb(nts),
+                    photo_path=ui_photo_tariff_night(s, config),
+                )
+            else:
+                await _edit_screen(
+                    callback,
+                    "<b>📦 Тарифы</b>\n\nВыберите: ночная или дневная запись.",
+                    tariff_category_kb(),
+                    photo_path=ui_photo_tariff_category(s, config),
+                )
         await callback.answer()
         return
     try:
@@ -1578,13 +1681,29 @@ async def tariff_pick_hours(callback: CallbackQuery, state: FSMContext, db: Data
         return
     data = await state.get_data()
     kind = data.get("tariff_kind")
+    s_opts = await db.get_all_settings()
     if kind == "night":
-        start = "00:00"
+        nts = tariff_night_start_list(s_opts)
+        start = data.get("tariff_night_start")
+        if not start:
+            if len(nts) == 1:
+                start = nts[0]
+                await state.update_data(tariff_night_start=start)
+            else:
+                await callback.answer("Сначала выберите время начала ночной сессии.", show_alert=True)
+                return
+        start = str(start)
     elif kind == "day":
         start = data.get("tariff_day_start")
         if not start:
-            await callback.answer("Сначала выберите время начала дня.", show_alert=True)
-            return
+            dts = tariff_day_start_list(s_opts)
+            if dts:
+                start = dts[0]
+                await state.update_data(tariff_day_start=start)
+            else:
+                await callback.answer("Сначала выберите время начала дня.", show_alert=True)
+                return
+        start = str(start)
     else:
         await callback.answer()
         return
@@ -1609,17 +1728,32 @@ async def tariff_cal_back(
     kind = data.get("tariff_kind")
     s = await db.get_all_settings()
     if kind == "night":
-        await _edit_screen(
-            callback,
-            "<b>🌙 Ночная запись</b>\n\nВыберите длительность:",
-            tariff_hours_kb(night=True, pricing=pricing, with_engineer=we),
-            photo_path=ui_photo_tariff_night(s, config),
-        )
+        nts = tariff_night_start_list(s)
+        if len(nts) > 1:
+            await _edit_screen(
+                callback,
+                "<b>🌙 Ночная запись</b>\n\nС какого времени начинается сессия?",
+                tariff_night_start_kb(nts),
+                photo_path=ui_photo_tariff_night(s, config),
+            )
+        else:
+            st0 = nts[0] if nts else "00:00"
+            await state.update_data(tariff_night_start=st0)
+            nb = "trf:c:back"
+            await _edit_screen(
+                callback,
+                f"<b>🌙 Ночная запись</b> (начало в {html_escape(st0)})\n\nВыберите длительность:",
+                tariff_hours_kb(
+                    night=True, pricing=pricing, with_engineer=we, night_back_callback=nb
+                ),
+                photo_path=ui_photo_tariff_night(s, config),
+            )
     elif kind == "day":
-        start = data.get("tariff_day_start") or "09:00"
+        dts = tariff_day_start_list(s)
+        start = data.get("tariff_day_start") or (dts[0] if dts else "09:00")
         await _edit_screen(
             callback,
-            f"<b>☀️ Дневная запись</b> (начало в {start})\n\nВыберите длительность:",
+            f"<b>☀️ Дневная запись</b> (начало в {html_escape(str(start))})\n\nВыберите длительность:",
             tariff_hours_kb(night=False, pricing=pricing, with_engineer=we),
             photo_path=ui_photo_tariff_day(s, config),
         )
@@ -2417,7 +2551,7 @@ async def paid(
             services_label=svc_title,
             total_price=int(data.get("total", 0)),
             notes=str(data.get("brief", "")),
-            status="pending_payment",
+            status="awaiting_yookassa" if use_yk else "pending_payment",
         )
         booking = await db.get_booking_by_id(order_id)
         await save_booking_pending_ui_cleanup(db, order_id, chat_id=chat_id, data=data)
@@ -2539,7 +2673,7 @@ async def paid(
         slot_ids=[int(x) for x in data["slot_ids"]],
         services=services_human,
         total_price=int(data["total"]),
-        status="pending_payment",
+        status="awaiting_yookassa" if use_yk else "pending_payment",
     )
     if not booking_id:
         await callback.answer("Не удалось создать запись. Возможно слот уже занят.", show_alert=True)

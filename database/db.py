@@ -469,7 +469,7 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE day = ? AND status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                 LIMIT 1
                 """,
@@ -541,7 +541,7 @@ class Database:
                 SELECT 1 FROM bookings
                 WHERE day = ?
                   AND status IN (
-                      'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                      'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                   )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
@@ -644,7 +644,7 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE user_id = ? AND status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                 LIMIT 1
                 """,
@@ -660,7 +660,7 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE user_id = ? AND status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
@@ -851,7 +851,7 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE user_id = ? AND status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                 LIMIT 1
@@ -951,7 +951,7 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT * FROM bookings WHERE id = ? AND status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                 """,
                 (booking_id,),
@@ -994,18 +994,24 @@ class Database:
             return booking
 
     async def confirm_booking_payment(self, booking_id: int) -> dict[str, Any] | None:
-        """pending_payment → active. Возвращает строку брони или None."""
+        """pending_payment / awaiting_yookassa → active. Возвращает строку брони или None."""
         async with self.connect() as db:
             self._configure(db)
             cur = await db.execute(
-                "SELECT * FROM bookings WHERE id = ? AND status = 'pending_payment'",
+                """
+                SELECT * FROM bookings WHERE id = ?
+                  AND status IN ('pending_payment', 'awaiting_yookassa')
+                """,
                 (booking_id,),
             )
             row = await cur.fetchone()
             if not row:
                 return None
             await db.execute(
-                "UPDATE bookings SET status = 'active' WHERE id = ? AND status = 'pending_payment'",
+                """
+                UPDATE bookings SET status = 'active' WHERE id = ?
+                  AND status IN ('pending_payment', 'awaiting_yookassa')
+                """,
                 (booking_id,),
             )
             await db.commit()
@@ -1056,7 +1062,7 @@ class Database:
             try:
                 m = json.loads(b.get("pending_meta") or "{}")
                 p = m.get("prev", "active")
-                if p in ("active", "pending_payment"):
+                if p in ("active", "pending_payment", "awaiting_yookassa"):
                     prev = p
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -1254,7 +1260,7 @@ class Database:
                 LEFT JOIN bookings b
                     ON b.day = ts.day
                    AND b.status IN (
-                       'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                       'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                    )
                    AND (b.booking_kind IS NULL OR b.booking_kind = 'studio')
                    AND (
@@ -1309,7 +1315,7 @@ class Database:
                 """
                 SELECT 1 FROM bookings
                 WHERE status IN (
-                    'active', 'pending_payment', 'pending_cancel', 'pending_reschedule'
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
                 )
                   AND (booking_kind IS NULL OR booking_kind = 'studio')
                   AND booked_slot_ids IS NOT NULL

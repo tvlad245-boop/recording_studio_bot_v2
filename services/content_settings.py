@@ -21,6 +21,44 @@ def format_maker_username(u: str) -> str:
     return u if u.startswith("@") else f"@{u}"
 
 
+def _parse_tariff_time_lines(stored: str | None, fallback_multiline: str) -> list[str]:
+    """Список уникальных времён ЧЧ:ММ для кнопок тарифов (настройки из админки)."""
+    raw = (stored or "").strip()
+    if not raw:
+        raw = fallback_multiline
+    out: list[str] = []
+    for piece in raw.replace(",", "\n").splitlines():
+        t = piece.strip()
+        if not t:
+            continue
+        nt = Database.normalize_time_str(t)
+        if nt not in out:
+            out.append(nt)
+    if not out:
+        for piece in fallback_multiline.splitlines():
+            t = piece.strip()
+            if not t:
+                continue
+            nt = Database.normalize_time_str(t)
+            if nt not in out:
+                out.append(nt)
+    return out
+
+
+def tariff_day_start_list(settings: dict[str, str]) -> list[str]:
+    return _parse_tariff_time_lines(
+        settings.get("tariff_day_start_times"),
+        "09:00\n12:00",
+    )
+
+
+def tariff_night_start_list(settings: dict[str, str]) -> list[str]:
+    return _parse_tariff_time_lines(
+        settings.get("tariff_night_start_times"),
+        "00:00",
+    )
+
+
 async def equipment_caption_html(db: Database, cfg: Config) -> str:
     s = await db.get_all_settings()
     if setting_bool(s, "equipment_use_custom", False):
