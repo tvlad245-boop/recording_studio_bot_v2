@@ -35,6 +35,24 @@ def _parse_webhook_meta(obj: dict) -> tuple[int, int]:
     return uid, bid
 
 
+def _safe_preview(body: dict) -> dict:
+    """
+    Логируем входящий webhook без чувствительных данных:
+    оставляем event, object.id, object.status и object.metadata.
+    """
+    obj = body.get("object") or {}
+    return {
+        "event": body.get("event"),
+        "type": body.get("type"),
+        "object": {
+            "id": obj.get("id"),
+            "status": obj.get("status"),
+            "paid": obj.get("paid"),
+            "metadata": obj.get("metadata"),
+        },
+    }
+
+
 @app.post("/yookassa-webhook")
 async def yookassa_webhook(request: Request) -> JSONResponse:
     try:
@@ -42,38 +60,53 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
+    # --- подробные логи для отладки ---
+    print("WEBHOOK RECEIVED")
+    try:
+        print("WEBHOOK BODY:", _safe_preview(body))
+    except Exception:
+        print("WEBHOOK BODY: <failed to preview>")
+
     ev = body.get("event")
+    print("EVENT:", ev)
     if ev != "payment.succeeded":
         return JSONResponse({"ok": True})
 
     obj = body.get("object") or {}
     payment_id = obj.get("id")
+    print("PAYMENT ID:", payment_id)
     if not payment_id:
+        print("PAYMENT ID: <missing>")
         logger.warning("YooKassa webhook: payment.succeeded without object.id")
         return JSONResponse({"ok": True})
 
     pid = str(payment_id)
-    meta = payments.get(pid)
-    if not meta:
-        u_meta, b_meta = _parse_webhook_meta(obj)
-        if b_meta and u_meta:
-            meta = {"user_id": u_meta, "slot": {"booking_id": b_meta}}
-            logger.info(
-                "YooKassa webhook: восстановление по metadata (нет записи в RAM) payment=%s booking=%s",
-                pid,
-                b_meta,
-            )
-        else:
-            logger.warning(
-                "YooKassa webhook: неизвестный платёж %s и нет booking_id в metadata — "
-                "проверьте URL webhook в кабинете ЮKassa и что бот с HTTPS доступен из интернета.",
-                pid,
-            )
-            return JSONResponse({"ok": True})
+    # 1) Сначала пробуем из metadata (надёжнее: не зависит от RAM)
+    u_meta, b_meta = _parse_webhook_meta(obj)
+    print("METADATA:", obj.get("metadata"))
+    user_id = int(u_meta or 0)
+    booking_id = int(b_meta or 0)
 
-    user_id = int(meta.get("user_id", 0))
-    slot = meta.get("slot") or {}
-    booking_id = int(slot.get("booking_id", 0) or 0)
+    if not user_id or not booking_id:
+        print("METADATA ERROR: user_id or booking_id is missing/empty")
+
+        # 2) Если metadata нет/пустая — пробуем локальное хранилище payments
+        meta = payments.get(pid) or {}
+        if meta:
+            try:
+                user_id = int(meta.get("user_id", 0) or 0)
+            except Exception:
+                user_id = 0
+            slot = meta.get("slot") or {}
+            try:
+                booking_id = int(slot.get("booking_id", 0) or 0)
+            except Exception:
+                booking_id = 0
+
+    if user_id:
+        print("USER FOUND")
+    else:
+        print("USER NOT FOUND")
 
     bot = get_bot()
     db = get_db()
@@ -81,15 +114,18 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
     reminder = get_reminder_service()
 
     if not bot or not db or not cfg or not reminder:
+        print("ERROR: webhook context is not initialized")
         logger.error("Webhook context is not initialized")
         return JSONResponse({"ok": False}, status_code=503)
 
     if not booking_id:
-        logger.warning("YooKassa webhook: missing booking_id in slot for payment %s", pid)
+        print("ERROR: BOOKING_ID missing; cannot confirm booking")
+        logger.warning("YooKassa webhook: missing booking_id for payment %s", pid)
         payments.pop(pid, None)
         return JSONResponse({"ok": True})
 
     try:
+        # Цель задачи: пользователь получает это сообщение автоматически после оплаты
         await bot.send_message(user_id, "Оплата прошла, запись подтверждена ✅")
     except Exception:
         logger.exception("Failed to notify user %s", user_id)
