@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -117,6 +118,14 @@ def _safe_preview(body: dict) -> dict:
     }
 
 
+async def _delete_later(bot, chat_id: int, message_id: int, *, delay_s: int = 25) -> None:
+    try:
+        await asyncio.sleep(max(1, int(delay_s)))
+        await bot.delete_message(int(chat_id), int(message_id))
+    except Exception:
+        pass
+
+
 @app.post("/yookassa-webhook")
 async def yookassa_webhook(request: Request) -> JSONResponse:
     if _WEBHOOK_TOKEN:
@@ -187,16 +196,6 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         logger.error("Webhook context is not initialized")
         return JSONResponse({"ok": False}, status_code=503)
 
-    # Идемпотентность: повторный webhook по тому же payment_id пропускаем
-    try:
-        first = await db.mark_yookassa_payment_processed(pid)
-    except Exception:
-        logger.exception("Failed to mark payment processed payment_id=%s", pid)
-        first = True
-    if not first:
-        logger.warning("Duplicate webhook ignored payment_id=%s", pid)
-        return JSONResponse({"ok": True})
-
     # Если metadata/RAM не дали booking_id или user_id — пробуем SQLite (переживает рестарты)
     if not booking_id or not user_id:
         try:
@@ -215,6 +214,16 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         payments.pop(pid, None)
         return JSONResponse({"ok": True})
 
+    # Идемпотентность: помечаем как обработанный только когда знаем booking_id
+    try:
+        first = await db.mark_yookassa_payment_processed(pid)
+    except Exception:
+        logger.exception("Failed to mark payment processed payment_id=%s", pid)
+        first = True
+    if not first:
+        logger.warning("Duplicate webhook ignored payment_id=%s", pid)
+        return JSONResponse({"ok": True})
+
     try:
         ok, _msg = await finalize_confirmed_payment(bot, db, cfg, reminder, booking_id)
         if not ok:
@@ -227,6 +236,14 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
     except Exception:
         logger.exception("finalize_confirmed_payment booking_id=%s", booking_id)
         return JSONResponse({"ok": True})
+
+    # Короткое подтверждение пользователю (авто-удаление, чтобы не засорять чат).
+    if user_id:
+        try:
+            m = await bot.send_message(int(user_id), "Оплата прошла, запись подтверждена ✅")
+            asyncio.create_task(_delete_later(bot, int(user_id), int(m.message_id), delay_s=25))
+        except Exception:
+            logger.exception("Failed to notify user %s", user_id)
 
     payments.pop(pid, None)
     try:
