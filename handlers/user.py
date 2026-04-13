@@ -1025,6 +1025,30 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
         except Exception:
             pass
 
+    # Ушли в меню, не оплатив ЮKassa — отменяем «висящую» бронь и освобождаем слоты.
+    cur_st = await state.get_state()
+    if cur_st == BookingStates.awaiting_payment_confirm.state:
+        bid = data.get("pending_booking_id")
+        if bid is not None:
+            b = await db.get_booking_by_id(int(bid))
+            if (
+                b
+                and int(b["user_id"]) == uid
+                and (b.get("status") or "") == "awaiting_yookassa"
+            ):
+                try:
+                    await delete_booking_pending_ui_messages(callback.bot, dict(b), db)
+                except Exception:
+                    pass
+                try:
+                    await db.cancel_booking(int(bid))
+                except Exception:
+                    logger.exception("cancel awaiting_yookassa on menu_home bid=%s", bid)
+                try:
+                    await _publish_weekly_and_tasks(callback.bot, db, config)
+                except Exception:
+                    pass
+
     await state.clear()
 
     act = await db.get_user_activity_message(uid)

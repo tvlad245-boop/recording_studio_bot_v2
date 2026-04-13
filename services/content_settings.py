@@ -192,9 +192,8 @@ async def cancel_refund_warning_html(db: Database, cfg: Config | None = None) ->
 
 
 async def append_manager_contact_html(db: Database, text: str, cfg: Config | None = None) -> str:
+    """Добавляет к тексту блок «Контакт менеджера» из админки; без подсказки «ответьте на сообщение»."""
     m = await manager_contact_html(db)
-    if not m and cfg is not None:
-        m = "<i>По вопросам оплаты напишите администратору в ответ на это сообщение.</i>"
     if not m:
         return text
     return f"{text}\n\n{m}"
