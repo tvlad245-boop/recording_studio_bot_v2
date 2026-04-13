@@ -128,6 +128,7 @@ def month_calendar_kb(
     nav_back_callback: str = "menu:home",
     nav_back_text: str = "⬅ В меню",
     closed_days_highlight: set[str] | None = None,
+    custom_day_labels: dict[str, str] | None = None,
 ) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=f"{month:02d}.{year}", callback_data="noop"))
@@ -151,7 +152,9 @@ def month_calendar_kb(
         elif blocked_days and current in blocked_days:
             btn = InlineKeyboardButton(text=f"❌{day_num}", callback_data="noop")
         elif current in allowed_days:
-            if closed_days_highlight and current in closed_days_highlight:
+            if custom_day_labels and current in custom_day_labels:
+                label = custom_day_labels[current]
+            elif closed_days_highlight and current in closed_days_highlight:
                 label = f"⛔{day_num}"
             else:
                 label = f"✅{day_num}"

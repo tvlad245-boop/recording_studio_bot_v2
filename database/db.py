@@ -135,6 +135,12 @@ class Database:
                     payment_id TEXT PRIMARY KEY,
                     processed_at TEXT NOT NULL
                 );
+
+                -- Исключения от правила «пн–пт со звукорежиссёром, сб–вс без»: on = работает в выходной, off = выходной в будний
+                CREATE TABLE IF NOT EXISTS engineer_day_exceptions (
+                    day TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK (kind IN ('on', 'off'))
+                );
                 """
             )
             await db.commit()
@@ -506,6 +512,99 @@ class Database:
             if row is None:
                 return False
             return bool(int(row["is_closed"] or 0))
+
+    @staticmethod
+    def engineer_weekday_default_works(day_iso: str) -> bool:
+        """Базовое правило: пн–пт — звукорежиссёр доступен, сб–вс — нет."""
+        try:
+            return date.fromisoformat(day_iso).weekday() < 5
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def engineer_effective_works(day_iso: str, kind: str | None) -> bool:
+        """С учётом строки из engineer_day_exceptions: on / off / нет записи."""
+        if kind == "off":
+            return False
+        if kind == "on":
+            return True
+        return Database.engineer_weekday_default_works(day_iso)
+
+    async def get_engineer_exceptions_bulk(self, days: list[str]) -> dict[str, str]:
+        """day -> 'on' | 'off' для переданных дат (пустой список — пустой dict)."""
+        if not days:
+            return {}
+        uniq = sorted({str(d) for d in days})
+        async with self.connect() as db:
+            self._configure(db)
+            ph = ",".join("?" * len(uniq))
+            cur = await db.execute(
+                f"SELECT day, kind FROM engineer_day_exceptions WHERE day IN ({ph})",
+                uniq,
+            )
+            rows = await cur.fetchall()
+            return {str(r["day"]): str(r["kind"]) for r in rows}
+
+    async def filter_days_for_engineer_booking(self, days: set[str]) -> set[str]:
+        """Оставляет только даты, когда можно запись со звукорежиссёром."""
+        if not days:
+            return set()
+        lst = sorted(days)
+        ex = await self.get_engineer_exceptions_bulk(lst)
+        return {d for d in lst if Database.engineer_effective_works(d, ex.get(d))}
+
+    async def toggle_engineer_day_exception(self, day: str) -> None:
+        """
+        Переключить день относительно правила по умолчанию (пн–пт / сб–вс).
+        Будний + работает → помечаем off. Будний + off → снимаем запись.
+        Выходной + не работает → on. Выходной + on → снимаем запись.
+        """
+        d_iso = str(day).strip()
+        try:
+            d = date.fromisoformat(d_iso)
+        except ValueError:
+            return
+        default_ok = d.weekday() < 5
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                "SELECT kind FROM engineer_day_exceptions WHERE day = ?",
+                (d_iso,),
+            )
+            row = await cur.fetchone()
+            kind = str(row["kind"]) if row else None
+        works = Database.engineer_effective_works(d_iso, kind)
+        async with self.connect() as db:
+            self._configure(db)
+            if works:
+                if default_ok:
+                    await db.execute(
+                        """
+                        INSERT OR REPLACE INTO engineer_day_exceptions(day, kind)
+                        VALUES (?, 'off')
+                        """,
+                        (d_iso,),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM engineer_day_exceptions WHERE day = ?",
+                        (d_iso,),
+                    )
+            else:
+                if not default_ok:
+                    await db.execute(
+                        """
+                        INSERT OR REPLACE INTO engineer_day_exceptions(day, kind)
+                        VALUES (?, 'on')
+                        """,
+                        (d_iso,),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM engineer_day_exceptions WHERE day = ?",
+                        (d_iso,),
+                    )
+            await db.commit()
 
     async def get_closed_days_in_month(self, year: int, month: int) -> set[str]:
         """Дни месяца, закрытые админом (work_days.is_closed = 1)."""
@@ -1418,19 +1517,15 @@ class Database:
         days_ahead: int,
         start_hhmm: str,
         hour_count: int,
-        block_weekends: bool,
+        require_engineer: bool,
     ) -> set[str]:
         """
         Дни, где подряд есть hour_count свободных почасовых слотов с start_hhmm.
-        block_weekends: для записи со звукорежиссёром — сб/вс исключаются.
+        require_engineer: только дни из графика звукорежиссёра (пн–пт + исключения в БД).
         """
         base = set(await self.get_available_days(days_ahead=days_ahead))
-        if block_weekends:
-            base = {
-                d
-                for d in base
-                if datetime.fromisoformat(d).weekday() < 5
-            }
+        if require_engineer:
+            base = await self.filter_days_for_engineer_booking(base)
         allowed: set[str] = set()
         for day in base:
             slots = await self.get_all_slots_for_day(day)

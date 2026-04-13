@@ -121,6 +121,54 @@ def _month_days(year: int, month: int) -> set[str]:
     return {date(year, month, d).isoformat() for d in range(1, days_count + 1)}
 
 
+def _engineer_admin_day_labels(
+    allowed_days: set[str], closed_days: set[str], ex_map: dict[str, str]
+) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for iso in sorted(allowed_days):
+        parts = iso.split("-")
+        try:
+            day_num = int(parts[2]) if len(parts) == 3 else 0
+        except (IndexError, ValueError):
+            day_num = 0
+        works = Database.engineer_effective_works(iso, ex_map.get(iso))
+        if iso in closed_days:
+            labels[iso] = f"⛔{day_num}"
+        else:
+            labels[iso] = f"{'🎛' if works else '✖'}{day_num}"
+    return labels
+
+
+_ENGINEER_CAL_HTML = (
+    "<b>🎛 График звукорежиссёра</b>\n\n"
+    "По умолчанию запись <b>со звукорежиссёром</b> доступна в <b>пн–пт</b>, "
+    "в <b>сб–вс</b> — только без режиссёра (если студия открыта).\n\n"
+    "Нажмите на число, чтобы <b>переключить</b> день для режиссёра "
+    "(сделать выходным в будний или <b>рабочим в выходной</b>).\n\n"
+    "🎛 — со звукорежиссёром можно · ✖ — нельзя · ⛔ — день закрыт студией.\n"
+)
+
+
+async def _engineer_calendar_markup(db: Database, y: int, m: int) -> InlineKeyboardMarkup:
+    today_iso = date.today().isoformat()
+    allowed = {d for d in _month_days(y, m) if d >= today_iso}
+    closed = await db.get_closed_days_in_month(y, m)
+    ex_map = await db.get_engineer_exceptions_bulk(sorted(allowed))
+    labels = _engineer_admin_day_labels(allowed, closed, ex_map)
+    return month_calendar_kb(
+        y,
+        m,
+        allowed,
+        prefix="engdate",
+        nav_prefix="engcal",
+        mark_past_as_blocked=True,
+        closed_days_highlight=None,
+        custom_day_labels=labels,
+        nav_back_callback="admin:home",
+        nav_back_text="⬅ Админ-панель",
+    )
+
+
 def _admin_abort_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅ Отмена", callback_data="admin:abort_input")
@@ -475,7 +523,7 @@ def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
 
 def admin_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📅 Добавить рабочий день", callback_data="admin:add_day")
+    kb.button(text="🎛️ График звукорежиссёра", callback_data="admin:engineer_days")
     kb.button(text="🔓🔒 Открыть / закрыть день", callback_data="admin:openclose_day")
     kb.button(text="➕ Добавить слот", callback_data="admin:add_slot")
     kb.button(text="➖ Удалить слот", callback_data="admin:remove_slot")
@@ -641,6 +689,15 @@ async def admin_actions(
         await callback.answer()
         return
 
+    if action == "engineer_days":
+        y, m = now_month()
+        await state.set_state(AdminStates.action_date)
+        await state.update_data(admin_action="engineer_days", cal_year=y, cal_month=m)
+        mk = await _engineer_calendar_markup(db, y, m)
+        await _admin_edit_panel(callback, _ENGINEER_CAL_HTML, mk)
+        await callback.answer()
+        return
+
     y, m = now_month()
     await state.set_state(AdminStates.action_date)
     await state.update_data(admin_action=action, cal_year=y, cal_month=m)
@@ -708,6 +765,52 @@ async def admin_calendar_nav(callback: CallbackQuery, state: FSMContext, db: Dat
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("engcal:"), AdminStates.action_date)
+async def admin_engineer_calendar_nav(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    if data.get("admin_action") != "engineer_days":
+        await callback.answer()
+        return
+    payload = callback.data.split(":", maxsplit=1)[1]
+    if payload == "today":
+        y, m = now_month()
+    else:
+        y_str, m_str = payload.split("-")
+        y, m = int(y_str), int(m_str)
+    await state.update_data(cal_year=y, cal_month=m)
+    mk = await _engineer_calendar_markup(db, y, m)
+    try:
+        await callback.message.edit_text(
+            _ENGINEER_CAL_HTML,
+            parse_mode=ParseMode.HTML,
+            reply_markup=mk,
+        )
+    except TelegramBadRequest:
+        await callback.message.edit_reply_markup(reply_markup=mk)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("engdate:"), AdminStates.action_date)
+async def admin_engineer_day_toggle(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    if data.get("admin_action") != "engineer_days":
+        await callback.answer()
+        return
+    picked_day = callback.data.split(":", maxsplit=1)[1]
+    if picked_day < date.today().isoformat():
+        await callback.answer("Прошедшие даты не меняем.", show_alert=True)
+        return
+    await db.toggle_engineer_day_exception(picked_day)
+    y = int(data.get("cal_year") or now_month()[0])
+    m = int(data.get("cal_month") or now_month()[1])
+    mk = await _engineer_calendar_markup(db, y, m)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=mk)
+    except TelegramBadRequest:
+        await _admin_edit_panel(callback, _ENGINEER_CAL_HTML, mk)
+    await callback.answer("График обновлён")
+
+
 @router.callback_query(F.data.startswith("admin_date:"), AdminStates.action_date)
 async def admin_date_selected(
     callback: CallbackQuery,
@@ -724,13 +827,6 @@ async def admin_date_selected(
     back_kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     back_kb.adjust(1)
     back_only = back_kb.as_markup()
-
-    if action == "add_day":
-        await db.add_work_day(picked_day)
-        await state.clear()
-        await _admin_edit_panel(callback, ADMIN_HOME_HTML, admin_menu_kb())
-        await callback.answer(f"Рабочий день {picked_day} добавлен")
-        return
 
     if action == "openclose_day":
         if await db.is_work_day_closed(picked_day):

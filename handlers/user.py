@@ -1369,19 +1369,14 @@ async def show_calendar(callback: CallbackQuery, state: FSMContext, db: Database
     data = await state.get_data()
     blocked: set[str] = set()
     if data.get("product") == "with_engineer":
-        from datetime import datetime as _dt
-        for d in list(available_days):
-            wd = _dt.fromisoformat(d).weekday()  # 0..6
-            if wd in (5, 6):  # Sat/Sun
-                blocked.add(d)
-        available_days = {d for d in available_days if d not in blocked}
+        available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(year, month)
     blocked = blocked | closed_admin
     await _edit(
         callback.message,
         "<b>📅 Выберите дату записи</b>\n\n"
         "✅ — есть свободные слоты\n"
-        "❌ — недоступно (прошедшие даты, выходные при записи с звукорежиссёром, день закрыт студией)\n\n"
+        "❌ — недоступно (прошлые даты, нет звукорежиссёра в этот день, день закрыт студией)\n\n"
         "<i>Показываем доступность на ближайшие 60 дней.</i>",
         reply_markup=month_calendar_kb(year, month, allowed_days=available_days, blocked_days=blocked),
     )
@@ -1402,12 +1397,12 @@ async def show_tariff_calendar(
     product = data.get("product")
     if product not in ("no_engineer", "with_engineer") or hours < 1:
         return
-    block_weekends = product == "with_engineer"
+    require_engineer = product == "with_engineer"
     allowed = await db.get_days_with_free_tariff_block(
         days_ahead=60,
         start_hhmm=start_hhmm,
         hour_count=hours,
-        block_weekends=block_weekends,
+        require_engineer=require_engineer,
     )
     if year is None or month is None:
         year, month = now_month()
@@ -1417,23 +1412,29 @@ async def show_tariff_calendar(
         f"<b>Ваше время: {st_label} — {end_label}</b>\n\n"
         "<b>📅 Выберите дату</b>\n\n"
         "✅ — весь интервал свободен для брони\n"
-        "❌ — нельзя выбрать (прошлые дни, занято, день закрыт студией или выходные при записи со звукорежиссёром)\n\n"
+        "❌ — нельзя выбрать (прошлые дни, занято, день закрыт студией или нет звукорежиссёра)\n\n"
         "<i>После выбора даты блокируется весь указанный отрезок.</i>"
     )
     closed_admin = await db.get_closed_days_in_month(year, month)
-    # Выходные не входят в allowed, но без blocked_days отображались бы обычными числами, а не ❌.
+    # Дни без режиссёра в месяце подсвечиваем ❌, даже если студия открыта (для записи без режиссёра слоты есть).
     _, dim = monthrange(year, month)
-    weekend_blocked: set[str] = set()
-    if block_weekends:
+    engineer_blocked: set[str] = set()
+    if require_engineer:
+        today_iso = dt_date.today().isoformat()
+        month_isos: list[str] = []
         for dn in range(1, dim + 1):
-            ddt = dt_date(year, month, dn)
-            if ddt.weekday() >= 5:
-                weekend_blocked.add(ddt.isoformat())
+            iso = dt_date(year, month, dn).isoformat()
+            if iso >= today_iso:
+                month_isos.append(iso)
+        ex_map = await db.get_engineer_exceptions_bulk(month_isos)
+        for iso in month_isos:
+            if not Database.engineer_effective_works(iso, ex_map.get(iso)):
+                engineer_blocked.add(iso)
     mk = month_calendar_kb(
         year,
         month,
         allowed_days=allowed,
-        blocked_days=closed_admin | weekend_blocked,
+        blocked_days=closed_admin | engineer_blocked,
         prefix="tdate",
         nav_prefix="tcal",
     )
@@ -3237,15 +3238,8 @@ async def reschedule_start(
         cal_month=m,
     )
     available_days = set(await db.get_available_days(days_ahead=60))
-    blocked: set[str] = set()
     if eng:
-        from datetime import datetime as _dt
-
-        for d in list(available_days):
-            wd = _dt.fromisoformat(d).weekday()
-            if wd in (5, 6):
-                blocked.add(d)
-        available_days = {d for d in available_days if d not in blocked}
+        available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(y, m)
     await _edit(
         callback.message,
@@ -3255,7 +3249,7 @@ async def reschedule_start(
             y,
             m,
             allowed_days=available_days,
-            blocked_days=blocked | closed_admin,
+            blocked_days=closed_admin,
             prefix="rsdate",
             nav_prefix="rscal",
             nav_back_callback="book:rsc:quit",
@@ -3279,15 +3273,8 @@ async def reschedule_calendar_nav(
     available_days = set(await db.get_available_days(days_ahead=60))
     data = await state.get_data()
     eng = bool(data.get("rs_engineer"))
-    blocked: set[str] = set()
     if eng:
-        from datetime import datetime as _dt
-
-        for d in list(available_days):
-            wd = _dt.fromisoformat(d).weekday()
-            if wd in (5, 6):
-                blocked.add(d)
-        available_days = {d for d in available_days if d not in blocked}
+        available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(y, m)
     await _edit(
         callback.message,
@@ -3296,7 +3283,7 @@ async def reschedule_calendar_nav(
             y,
             m,
             allowed_days=available_days,
-            blocked_days=blocked | closed_admin,
+            blocked_days=closed_admin,
             prefix="rsdate",
             nav_prefix="rscal",
             nav_back_callback="book:rsc:quit",
@@ -3417,15 +3404,8 @@ async def reschedule_slot_back_calendar(
     await state.set_state(BookingStates.reschedule_pick_date)
     await state.update_data(rs_selected_slot_ids=[], rs_day=None)
     available_days = set(await db.get_available_days(days_ahead=60))
-    blocked: set[str] = set()
     if eng:
-        from datetime import datetime as _dt
-
-        for d in list(available_days):
-            wd = _dt.fromisoformat(d).weekday()
-            if wd in (5, 6):
-                blocked.add(d)
-        available_days = {d for d in available_days if d not in blocked}
+        available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(y, m)
     await _edit(
         callback.message,
@@ -3434,7 +3414,7 @@ async def reschedule_slot_back_calendar(
             y,
             m,
             allowed_days=available_days,
-            blocked_days=blocked | closed_admin,
+            blocked_days=closed_admin,
             prefix="rsdate",
             nav_prefix="rscal",
             nav_back_callback="book:rsc:quit",
