@@ -120,6 +120,27 @@ async def effective_maker_username(db: Database, cfg: Config, *, kind: str) -> s
     return cfg.textmaker_username if kind == "lyrics" else cfg.beatmaker_username
 
 
+async def cancel_request_sent_body_html(db: Database, *, studio: bool) -> str:
+    """Текст после отправки запроса на отмену (настраивается в «Тексты для клиентов»)."""
+    s = await db.get_all_settings()
+    raw = (s.get("cancel_request_sent_html") or "").strip()
+    if raw:
+        return raw
+    if studio:
+        return (
+            "<b>⏳ Запрос на отмену отправлен.</b>\n\n"
+            "Ожидайте решения оператора. Слот пока занят."
+        )
+    return "<b>⏳ Запрос на отмену отправлен.</b>\n\nОжидайте решения оператора."
+
+
+async def cancel_confirmed_custom_html(db: Database, booking_kind: str) -> str:
+    """Если задано в админке — основной HTML после подтверждённой отмены (до предупреждения о возврате и контакта менеджера)."""
+    s = await db.get_all_settings()
+    key = "cancel_confirmed_service_html" if booking_kind in ("lyrics", "beat") else "cancel_confirmed_studio_html"
+    return (s.get(key) or "").strip()
+
+
 async def cancel_refund_warning_html(db: Database, cfg: Config | None = None) -> str:
     s = await db.get_all_settings()
     raw = (s.get("cancel_refund_warning_html") or "").strip()

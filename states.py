@@ -3,6 +3,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 class BookingStates(StatesGroup):
     choosing_product = State()
+    choosing_pay_method = State()
     choosing_studio_mode = State()
     choosing_tariff = State()
     choosing_tariff_date = State()

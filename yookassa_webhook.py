@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import os
-import asyncio
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -118,14 +117,6 @@ def _safe_preview(body: dict) -> dict:
     }
 
 
-async def _delete_later(bot, chat_id: int, message_id: int, *, delay_s: int = 25) -> None:
-    try:
-        await asyncio.sleep(max(1, int(delay_s)))
-        await bot.delete_message(int(chat_id), int(message_id))
-    except Exception:
-        pass
-
-
 @app.post("/yookassa-webhook")
 async def yookassa_webhook(request: Request) -> JSONResponse:
     if _WEBHOOK_TOKEN:
@@ -225,7 +216,14 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     try:
-        ok, _msg = await finalize_confirmed_payment(bot, db, cfg, reminder, booking_id)
+        ok, _msg = await finalize_confirmed_payment(
+            bot,
+            db,
+            cfg,
+            reminder,
+            booking_id,
+            success_entry_prefix_html="<b>✅ Оплата прошла успешно, запись подтверждена</b>",
+        )
         if not ok:
             logger.warning(
                 "finalize_confirmed_payment failed for booking_id=%s (maybe already done)",
@@ -236,14 +234,6 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
     except Exception:
         logger.exception("finalize_confirmed_payment booking_id=%s", booking_id)
         return JSONResponse({"ok": True})
-
-    # Короткое подтверждение пользователю (авто-удаление, чтобы не засорять чат).
-    if user_id:
-        try:
-            m = await bot.send_message(int(user_id), "Оплата прошла, запись подтверждена ✅")
-            asyncio.create_task(_delete_later(bot, int(user_id), int(m.message_id), delay_s=25))
-        except Exception:
-            logger.exception("Failed to notify user %s", user_id)
 
     payments.pop(pid, None)
     try:

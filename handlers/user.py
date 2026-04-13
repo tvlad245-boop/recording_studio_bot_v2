@@ -41,6 +41,7 @@ from services.content_settings import (
     post_payment_contact_block_html,
     append_manager_contact_html,
     cancel_refund_warning_html,
+    cancel_request_sent_body_html,
     manager_contact_html,
     studio_address_html,
     studio_directions_video_file_id,
@@ -61,6 +62,7 @@ from keyboards import (
     my_bookings_kb,
     now_month,
     paid_kb,
+    payment_method_kb,
     reschedule_confirm_kb,
     slots_pick_kb,
     slots_rs_pick_kb,
@@ -190,7 +192,7 @@ async def save_booking_pending_ui_cleanup(
     await db.update_booking_client_cleanup(booking_id, payload)
 
 
-async def delete_booking_pending_ui_messages(bot: Bot, booking: dict[str, Any]) -> None:
+async def delete_booking_pending_ui_messages(bot: Bot, booking: dict[str, Any], db: Database) -> None:
     """Удаляет у клиента экран ожидания и сообщение с контактами (сохранённые при «Я оплатил»)."""
     raw = booking.get("client_cleanup_json")
     if not raw:
@@ -198,11 +200,19 @@ async def delete_booking_pending_ui_messages(bot: Bot, booking: dict[str, Any]) 
     try:
         p = json.loads(raw)
         cid = int(p["chat_id"])
+        act_mid: int | None = None
+        act_chat: int | None = None
+        row = await db.get_user_activity_message(int(booking["user_id"]))
+        if row:
+            act_mid = int(row["message_id"])
+            act_chat = int(row["chat_id"])
         mids: list[int] = []
         if p.get("root") is not None:
             mids.append(int(p["root"]))
         mids.extend(int(x) for x in (p.get("extra") or []))
         for mid in mids:
+            if act_mid is not None and act_chat is not None and mid == act_mid and cid == act_chat:
+                continue
             try:
                 await bot.delete_message(cid, mid)
             except Exception:
@@ -219,10 +229,16 @@ async def delete_pending_ui_and_send_main_menu(
     booking_snapshot: dict[str, Any],
     announcement_html: str,
 ) -> None:
-    """После решения по заявке: убрать экран ожидания у клиента и показать главное меню."""
-    await delete_booking_pending_ui_messages(bot, booking_snapshot)
+    """После решения по заявке: убрать вспомогательные сообщения и показать текст в «липком» главном окне."""
+    await delete_booking_pending_ui_messages(bot, booking_snapshot, db)
     uid = int(booking_snapshot["user_id"])
     ann = (announcement_html or "").strip()
+    act = await db.get_user_activity_message(uid)
+    if act:
+        if ann:
+            await db.set_user_activity_notice(uid, ann)
+        await _render_user_activity_message(bot, db, config, uid)
+        return
     if ann:
         try:
             await bot.send_message(uid, _truncate_html(ann, 4096), parse_mode=ParseMode.HTML)
@@ -262,12 +278,14 @@ async def finalize_confirmed_payment(
     cfg: Config,
     reminder_service: ReminderService,
     booking_id: int,
+    *,
+    success_entry_prefix_html: str | None = None,
 ) -> tuple[bool, str]:
     """pending_payment → active, напоминания, канал, сводка пользователю, уведомление в чат."""
     row = await db.confirm_booking_payment(booking_id)
     if not row:
         return False, "Заявка не найдена или уже обработана"
-    await delete_booking_pending_ui_messages(bot, row)
+    await delete_booking_pending_ui_messages(bot, row, db)
     kind = row.get("booking_kind") or "studio"
     if kind in (None, "studio"):
         await reminder_service.schedule_for_booking(row)
@@ -305,6 +323,8 @@ async def finalize_confirmed_payment(
         mgr = await manager_contact_html(db)
         if mgr:
             entry += f"\n\n{mgr}"
+    if success_entry_prefix_html:
+        entry = f"{success_entry_prefix_html.strip()}\n\n{entry}"
     await _upsert_user_success_summary(
         bot,
         db,
@@ -676,6 +696,25 @@ _ACTIVITY_FOOTER = "\n\n<b>🏠 Главное меню</b> — выберите
 _MAX_ACTIVITY_BODY_STORE = 10000
 
 
+def _activity_caption_pair(notice_html: str, body_html: str) -> tuple[str, str]:
+    notice = (notice_html or "").strip()
+    body = (body_html or "").strip()
+    if not body:
+        body = "<i>Нет активных заявок в этом списке.</i>"
+    core = _ACTIVITY_HEADER + body + _ACTIVITY_FOOTER
+    full = f"{notice}\n\n{core}" if notice else core
+    return _truncate_html(full, 1024), _truncate_html(full, 4096)
+
+
+async def _render_user_activity_message(bot, db: Database, config: Config, user_id: int) -> None:
+    row = await db.get_user_activity_message(user_id)
+    if not row:
+        return
+    await _sync_user_activity_body_html(
+        bot, db, config, user_id=user_id, inner_body_html=str(row.get("body_html") or "")
+    )
+
+
 async def _upsert_user_success_summary(
     bot,
     db: Database,
@@ -696,9 +735,7 @@ async def _upsert_user_success_summary(
     if len(body) > _MAX_ACTIVITY_BODY_STORE:
         body = "…\n\n" + body[-_MAX_ACTIVITY_BODY_STORE:]
 
-    full = _ACTIVITY_HEADER + body + _ACTIVITY_FOOTER
-    caption_display = _truncate_html(full, 1024)
-    text_display = _truncate_html(full, 4096)
+    caption_display, text_display = _activity_caption_pair("", body)
 
     prev_mid = int(row["message_id"]) if row else None
     prev_chat = int(row["chat_id"]) if row else chat_id
@@ -720,7 +757,9 @@ async def _upsert_user_success_summary(
                     media=media,
                     reply_markup=main_menu_kb(),
                 )
-                await db.upsert_user_activity_message(user_id, prev_chat, prev_mid, body)
+                await db.upsert_user_activity_message(
+                    user_id, prev_chat, prev_mid, body, notice_html=""
+                )
                 return
             except TelegramBadRequest as e:
                 err = str(e).lower()
@@ -735,7 +774,9 @@ async def _upsert_user_success_summary(
                         )
                     except TelegramBadRequest:
                         pass
-                    await db.upsert_user_activity_message(user_id, prev_chat, prev_mid, body)
+                    await db.upsert_user_activity_message(
+                        user_id, prev_chat, prev_mid, body, notice_html=""
+                    )
                     return
                 # нельзя сменить медиа (например, прошлое сообщение было текстом) — удаляем и шлём фото
             except Exception:
@@ -751,7 +792,9 @@ async def _upsert_user_success_summary(
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_kb(),
         )
-        await db.upsert_user_activity_message(user_id, chat_id, int(msg.message_id), body)
+        await db.upsert_user_activity_message(
+            user_id, chat_id, int(msg.message_id), body, notice_html=""
+        )
         return
 
     if prev_mid:
@@ -763,11 +806,15 @@ async def _upsert_user_success_summary(
                 reply_markup=main_menu_kb(),
                 parse_mode=ParseMode.HTML,
             )
-            await db.upsert_user_activity_message(user_id, prev_chat, prev_mid, body)
+            await db.upsert_user_activity_message(
+                user_id, prev_chat, prev_mid, body, notice_html=""
+            )
             return
         except TelegramBadRequest as e:
             if "message is not modified" in str(e).lower():
-                await db.upsert_user_activity_message(user_id, prev_chat, prev_mid, body)
+                await db.upsert_user_activity_message(
+                    user_id, prev_chat, prev_mid, body, notice_html=""
+                )
                 return
         except Exception:
             pass
@@ -782,7 +829,9 @@ async def _upsert_user_success_summary(
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
     )
-    await db.upsert_user_activity_message(user_id, chat_id, int(msg.message_id), body)
+    await db.upsert_user_activity_message(
+        user_id, chat_id, int(msg.message_id), body, notice_html=""
+    )
 
 
 async def _sync_user_activity_body_html(
@@ -803,9 +852,8 @@ async def _sync_user_activity_body_html(
     if len(body) > _MAX_ACTIVITY_BODY_STORE:
         body = "…\n\n" + body[-_MAX_ACTIVITY_BODY_STORE:]
 
-    full = _ACTIVITY_HEADER + body + _ACTIVITY_FOOTER
-    caption_display = _truncate_html(full, 1024)
-    text_display = _truncate_html(full, 4096)
+    notice = (row.get("notice_html") or "").strip()
+    caption_display, text_display = _activity_caption_pair(notice, body)
 
     prev_mid = int(row["message_id"])
     prev_chat = int(row["chat_id"])
@@ -966,7 +1014,7 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
     prompt_id = data.get("brief_prompt_message_id")
     root_id = data.get("payment_root_message_id") or data.get("brief_root_message_id")
     chat_id = callback.message.chat.id
-    target_mid = int(root_id) if root_id else int(callback.message.message_id)
+    uid = callback.from_user.id
 
     if prompt_id:
         try:
@@ -976,6 +1024,13 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
 
     await state.clear()
 
+    act = await db.get_user_activity_message(uid)
+    if act:
+        await _render_user_activity_message(callback.bot, db, config, uid)
+        await callback.answer()
+        return
+
+    target_mid = int(root_id) if root_id else int(callback.message.message_id)
     await _present_main_menu_on_message(
         callback.bot,
         chat_id=chat_id,
@@ -1144,33 +1199,49 @@ async def pick_product(
         await callback.answer()
         return
 
-    # Текст/бит: одно текстовое сообщение — шаг «описание» и «оплата» меняют его через edit (без лимита подписи к фото).
+    # Текст/бит: одно сообщение — описание и экран оплаты правятся через edit.
     price = pricing.service_price(code)
-    await state.set_state(BookingStates.entering_brief)
+    await state.update_data(pay_online=False)
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
         await callback.message.delete()
     except Exception:
         pass
-    screen = (
-        "<b>📝 Опишите заказ</b>\n\n"
-        "Отправьте <b>несколько строк</b> в таком порядке:\n"
-        "• сначала — <b>пожелания</b> к заказу (можно несколько строк);\n"
-        "• затем <b>4 отдельные строки</b>:\n"
-        "  — имя\n"
-        "  — фамилия\n"
-        "  — банк (с какого будет оплата)\n"
-        "  — ваш @username в Telegram (или «—» если без username)\n\n"
-        f"<b>Стоимость:</b> {price} руб"
-    )
     s = await db.get_all_settings()
+    pay_ph = ui_photo_payment(s, config)
+    if is_yookassa_configured(config):
+        await state.set_state(BookingStates.choosing_pay_method)
+        screen = (
+            "<b>📝 Заказ: текст или бит</b>\n\n"
+            f"<b>Стоимость:</b> {price} руб\n\n"
+            "<b>Как будете оплачивать?</b>\n"
+            "• <b>Онлайн (ЮKassa)</b> — после описания заказа откроется ссылка на оплату; "
+            "фамилию и банк указывать не нужно.\n"
+            "• <b>Перевод на карту</b> — в конце сообщения понадобятся имя, фамилия, банк и @username.\n\n"
+            "Выберите вариант ниже."
+        )
+        kb = payment_method_kb()
+    else:
+        await state.set_state(BookingStates.entering_brief)
+        screen = (
+            "<b>📝 Опишите заказ</b>\n\n"
+            "Отправьте <b>несколько строк</b> в таком порядке:\n"
+            "• сначала — <b>пожелания</b> к заказу (можно несколько строк);\n"
+            "• затем <b>4 отдельные строки</b>:\n"
+            "  — имя\n"
+            "  — фамилия\n"
+            "  — банк (с какого будет оплата)\n"
+            "  — ваш @username в Telegram (или «—» если без username)\n\n"
+            f"<b>Стоимость:</b> {price} руб"
+        )
+        kb = back_to_menu_kb()
     sent_id, is_photo = await _send_payment_screen_message(
         callback.bot,
         chat_id=chat_id,
         text=screen,
-        reply_markup=back_to_menu_kb(),
-        photo_path=ui_photo_payment(s, config),
+        reply_markup=kb,
+        photo_path=pay_ph,
     )
     await state.update_data(
         payment_root_message_id=sent_id,
@@ -1564,6 +1635,83 @@ async def tariff_calendar_nav(callback: CallbackQuery, state: FSMContext, db: Da
     await callback.answer()
 
 
+async def _send_studio_pay_contact_screen(
+    bot: Bot,
+    *,
+    chat_id: int,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
+    day: str,
+    slot_text: str,
+    hours: int,
+    total: int,
+    product: str,
+    tariff_label: str | None,
+) -> None:
+    await state.update_data(pay_online=False)
+    svc_line = html_escape(str(tariff_label or pricing.service_title(product)))
+    base_core = "\n".join(
+        [
+            f"<b>Услуга:</b> {svc_line}",
+            f"<b>Дата:</b> {day}",
+            f"<b>Время:</b> {slot_text}",
+            f"<b>Часов:</b> {hours}",
+            f"<b>Итого:</b> {total} руб",
+        ]
+    )
+    s = await db.get_all_settings()
+    pay_ph = ui_photo_payment(s, config)
+    if is_yookassa_configured(config):
+        await state.set_state(BookingStates.choosing_pay_method)
+        text = (
+            "<b>💳 Оплата записи</b>\n\n"
+            f"{base_core}\n\n"
+            "<b>Способ оплаты</b>\n"
+            "• <b>Онлайн (ЮKassa)</b> — после ввода данных откроется ссылка; фамилию и банк указывать не нужно.\n"
+            "• <b>Перевод на карту</b> — реквизиты и форма: имя, фамилия, банк, @username.\n\n"
+            "Выберите вариант ниже."
+        )
+        sent_id, is_photo = await _send_payment_screen_message(
+            bot,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=payment_method_kb(),
+            photo_path=pay_ph,
+        )
+    else:
+        await state.set_state(BookingStates.entering_contacts)
+        dest = payment_destination_block_html(config)
+        text = (
+            "<b>💳 Реквизиты для оплаты</b>\n\n"
+            f"{base_core}\n\n"
+            f"{dest}\n\n"
+            "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
+            "• имя\n"
+            "• фамилия\n"
+            "• банк (с какого будет оплата)\n"
+            "• ваш @username в Telegram (или «—»)\n\n"
+            "<i>Пример:\n"
+            "Иван\n"
+            "Иванов\n"
+            "Сбербанк\n"
+            "@nickname</i>"
+        )
+        sent_id, is_photo = await _send_payment_screen_message(
+            bot,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=back_to_menu_kb(),
+            photo_path=pay_ph,
+        )
+    await state.update_data(
+        payment_root_message_id=sent_id,
+        payment_root_is_photo=is_photo,
+        cleanup_ids=[],
+    )
+
+
 @router.callback_query(F.data.startswith("tdate:"), BookingStates.choosing_tariff_date)
 async def pick_tariff_date(
     callback: CallbackQuery, state: FSMContext, db: Database, config: Config, pricing: EffectivePricing
@@ -1604,45 +1752,25 @@ async def pick_tariff_date(
         booking_mode="tariff",
         tariff_label=tariff_label,
     )
-    await state.set_state(BookingStates.entering_contacts)
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
         await callback.message.delete()
     except Exception:
         pass
-    dest = payment_destination_block_html(config)
-    screen1 = (
-        "<b>💳 Реквизиты для оплаты</b>\n\n"
-        f"<b>Услуга:</b> {html_escape(tariff_label)}\n"
-        f"<b>Дата:</b> {picked_day}\n"
-        f"<b>Время:</b> {slot_text}\n"
-        f"<b>Часов:</b> {hours}\n"
-        f"<b>Итого:</b> {total} руб\n\n"
-        f"{dest}\n\n"
-        "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
-        "• имя\n"
-        "• фамилия\n"
-        "• банк (с какого будет оплата)\n"
-        "• ваш @username в Telegram (или «—»)\n\n"
-        "<i>Пример:\n"
-        "Иван\n"
-        "Иванов\n"
-        "Сбербанк\n"
-        "@nickname</i>"
-    )
-    s = await db.get_all_settings()
-    sent_id, is_photo = await _send_payment_screen_message(
+    await _send_studio_pay_contact_screen(
         callback.bot,
         chat_id=chat_id,
-        text=screen1,
-        reply_markup=back_to_menu_kb(),
-        photo_path=ui_photo_payment(s, config),
-    )
-    await state.update_data(
-        payment_root_message_id=sent_id,
-        payment_root_is_photo=is_photo,
-        cleanup_ids=[],
+        state=state,
+        config=config,
+        db=db,
+        pricing=pricing,
+        day=picked_day,
+        slot_text=slot_text,
+        hours=hours,
+        total=total,
+        product=str(product),
+        tariff_label=tariff_label,
     )
 
 
@@ -1757,7 +1885,6 @@ async def slot_confirm(
         tariff_label=None,
         booking_mode="hourly",
     )
-    await state.set_state(BookingStates.entering_contacts)
 
     await callback.answer()
     chat_id = callback.message.chat.id
@@ -1766,39 +1893,162 @@ async def slot_confirm(
     except Exception:
         pass
 
-    dest = payment_destination_block_html(config)
-    screen1 = (
-        "<b>💳 Реквизиты для оплаты</b>\n\n"
-        f"<b>Услуга:</b> {pricing.service_title(product)}\n"
-        f"<b>Дата:</b> {day}\n"
-        f"<b>Время:</b> {slot_text}\n"
-        f"<b>Часов:</b> {hours}\n"
-        f"<b>Итого:</b> {total} руб\n\n"
-        f"{dest}\n\n"
-        "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
-        "• имя\n"
-        "• фамилия\n"
-        "• банк (с какого будет оплата)\n"
-        "• ваш @username в Telegram (или «—»)\n\n"
-        "<i>Пример:\n"
-        "Иван\n"
-        "Иванов\n"
-        "Сбербанк\n"
-        "@nickname</i>"
-    )
-    s = await db.get_all_settings()
-    sent_id, is_photo = await _send_payment_screen_message(
+    await _send_studio_pay_contact_screen(
         callback.bot,
         chat_id=chat_id,
-        text=screen1,
-        reply_markup=back_to_menu_kb(),
-        photo_path=ui_photo_payment(s, config),
+        state=state,
+        config=config,
+        db=db,
+        pricing=pricing,
+        day=day,
+        slot_text=slot_text,
+        hours=hours,
+        total=total,
+        product=str(product),
+        tariff_label=None,
     )
-    await state.update_data(
-        payment_root_message_id=sent_id,
-        payment_root_is_photo=is_photo,
-        cleanup_ids=[],
+
+@router.callback_query(F.data.startswith("paymeth:"), BookingStates.choosing_pay_method)
+async def pay_method_chosen(
+    callback: CallbackQuery,
+    state: FSMContext,
+    config: Config,
+    db: Database,
+    pricing: EffectivePricing,
+) -> None:
+    choice = callback.data.split(":", 1)[1]
+    if choice not in ("online", "standard"):
+        await callback.answer()
+        return
+    pay_online = choice == "online"
+    await state.update_data(pay_online=pay_online)
+    data = await state.get_data()
+    product = data.get("product")
+    root_mid = data.get("payment_root_message_id")
+    is_photo = bool(data.get("payment_root_is_photo", False))
+    cid = callback.message.chat.id
+    if not root_mid:
+        await callback.answer("Сессия устарела. Откройте меню и начните снова.", show_alert=True)
+        return
+
+    s = await db.get_all_settings()
+    pay_path = ui_photo_payment(s, config)
+
+    if product in ("lyrics", "beat"):
+        await state.set_state(BookingStates.entering_brief)
+        price = pricing.service_price(product)
+        if pay_online:
+            screen = (
+                "<b>📝 Опишите заказ</b>\n\n"
+                "Отправьте сообщение в таком порядке:\n"
+                "• сначала — <b>пожелания</b> к заказу (можно несколько строк);\n"
+                "• затем <b>2 строки</b>:\n"
+                "  — имя\n"
+                "  — ваш @username в Telegram (или «—» если без username)\n\n"
+                f"<b>Стоимость:</b> {price} руб"
+            )
+        else:
+            screen = (
+                "<b>📝 Опишите заказ</b>\n\n"
+                "Отправьте <b>несколько строк</b> в таком порядке:\n"
+                "• сначала — <b>пожелания</b> к заказу (можно несколько строк);\n"
+                "• затем <b>4 отдельные строки</b>:\n"
+                "  — имя\n"
+                "  — фамилия\n"
+                "  — банк (с какого будет оплата)\n"
+                "  — ваш @username в Telegram (или «—» если без username)\n\n"
+                f"<b>Стоимость:</b> {price} руб"
+            )
+        try:
+            await _edit_payment_screen_message(
+                callback.bot,
+                chat_id=cid,
+                message_id=int(root_mid),
+                text=screen,
+                reply_markup=back_to_menu_kb(),
+                is_photo=is_photo,
+            )
+        except Exception:
+            new_id, new_ph = await _send_payment_screen_message(
+                callback.bot,
+                chat_id=cid,
+                text=screen,
+                reply_markup=back_to_menu_kb(),
+                photo_path=pay_path,
+            )
+            await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
+        await callback.answer()
+        return
+
+    if product not in ("no_engineer", "with_engineer"):
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+
+    day = data.get("day")
+    slot_text = data.get("slot_text")
+    total = data.get("total")
+    slot_ids = data.get("slot_ids") or []
+    hours = len(slot_ids)
+    tariff_label = data.get("tariff_label")
+    svc_line = html_escape(str(tariff_label or pricing.service_title(product)))
+    base_core = "\n".join(
+        [
+            f"<b>Услуга:</b> {svc_line}",
+            f"<b>Дата:</b> {day}",
+            f"<b>Время:</b> {slot_text}",
+            f"<b>Часов:</b> {hours}",
+            f"<b>Итого:</b> {total} руб",
+        ]
     )
+    await state.set_state(BookingStates.entering_contacts)
+    if pay_online:
+        screen = (
+            "<b>💳 Онлайн-оплата (ЮKassa)</b>\n\n"
+            f"{base_core}\n\n"
+            "Отправьте <b>одним сообщением (2 строки)</b>:\n"
+            "• имя\n"
+            "• ваш @username в Telegram (или «—»)\n\n"
+            "<i>Пример:\n"
+            "Иван\n"
+            "@nickname</i>"
+        )
+    else:
+        dest = payment_destination_block_html(config)
+        screen = (
+            "<b>💳 Реквизиты для оплаты</b>\n\n"
+            f"{base_core}\n\n"
+            f"{dest}\n\n"
+            "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
+            "• имя\n"
+            "• фамилия\n"
+            "• банк (с какого будет оплата)\n"
+            "• ваш @username в Telegram (или «—»)\n\n"
+            "<i>Пример:\n"
+            "Иван\n"
+            "Иванов\n"
+            "Сбербанк\n"
+            "@nickname</i>"
+        )
+    try:
+        await _edit_payment_screen_message(
+            callback.bot,
+            chat_id=cid,
+            message_id=int(root_mid),
+            text=screen,
+            reply_markup=back_to_menu_kb(),
+            is_photo=is_photo,
+        )
+    except Exception:
+        new_id, new_ph = await _send_payment_screen_message(
+            callback.bot,
+            chat_id=cid,
+            text=screen,
+            reply_markup=back_to_menu_kb(),
+            photo_path=pay_path,
+        )
+        await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
+    await callback.answer()
+
 
 @router.message(BookingStates.entering_brief)
 async def enter_brief(
@@ -1812,37 +2062,64 @@ async def enter_brief(
         return
 
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    if len(lines) < 5:
-        warn = await message.answer(
-            "Нужно минимум 5 строк: пожелания (можно несколько строк), затем имя, фамилию, банк и @username "
-            "(или «—»).\n\n"
-            "Пример:\n"
-            "Хочу поп, женский вокал, минор...\n"
-            "Иван\n"
-            "Иванов\n"
-            "Сбербанк\n"
-            "@nickname"
-        )
+    pay_online = bool(data.get("pay_online"))
+    min_lines = 3 if pay_online else 5
+    if len(lines) < min_lines:
+        if pay_online:
+            warn = await message.answer(
+                "Нужно минимум 3 строки: пожелания (можно несколько строк), затем имя и @username (или «—»).\n\n"
+                "Пример:\n"
+                "Хочу поп, женский вокал, минор...\n"
+                "Иван\n"
+                "@nickname"
+            )
+        else:
+            warn = await message.answer(
+                "Нужно минимум 5 строк: пожелания (можно несколько строк), затем имя, фамилию, банк и @username "
+                "(или «—»).\n\n"
+                "Пример:\n"
+                "Хочу поп, женский вокал, минор...\n"
+                "Иван\n"
+                "Иванов\n"
+                "Сбербанк\n"
+                "@nickname"
+            )
         c = list(data.get("cleanup_ids", []))
         c.extend([message.message_id, warn.message_id])
         await state.update_data(cleanup_ids=c)
         return
 
-    first_name = lines[-4]
-    last_name = lines[-3]
-    bank = lines[-2]
-    tg_line = lines[-1]
-    brief = "\n".join(lines[:-4]).strip()
-    user_display_name = f"{first_name} {last_name}".strip()
-    tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
-    if len(brief) < 10 or len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
-        warn = await message.answer(
-            "Проверьте: пожелания (от 10 символов), имя, фамилию, банк (от 2 символов), username."
-        )
-        c = list(data.get("cleanup_ids", []))
-        c.extend([message.message_id, warn.message_id])
-        await state.update_data(cleanup_ids=c)
-        return
+    if pay_online:
+        first_name = lines[-2]
+        tg_line = lines[-1]
+        brief = "\n".join(lines[:-2]).strip()
+        user_display_name = first_name.strip()
+        bank = "—"
+        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+        if len(brief) < 10 or len(first_name) < 1:
+            warn = await message.answer(
+                "Проверьте: пожелания (от 10 символов), имя и username."
+            )
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
+    else:
+        first_name = lines[-4]
+        last_name = lines[-3]
+        bank = lines[-2]
+        tg_line = lines[-1]
+        brief = "\n".join(lines[:-4]).strip()
+        user_display_name = f"{first_name} {last_name}".strip()
+        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+        if len(brief) < 10 or len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
+            warn = await message.answer(
+                "Проверьте: пожелания (от 10 символов), имя, фамилию, банк (от 2 символов), username."
+            )
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
 
     price = pricing.service_price(product)
     await state.update_data(
@@ -1857,13 +2134,22 @@ async def enter_brief(
     is_photo = data.get("payment_root_is_photo", False)
     if root_mid:
         dest = payment_destination_block_html(config)
-        pay_screen = (
-            "<b>💳 Реквизиты для оплаты</b>\n\n"
-            f"<b>Услуга:</b> {pricing.service_title(product)}\n"
-            f"<b>Стоимость:</b> {price} руб\n\n"
-            f"{dest}\n\n"
-            "После оплаты нажмите кнопку ниже."
-        )
+        use_yk_btn = bool(is_yookassa_configured(config) and pay_online)
+        if use_yk_btn:
+            pay_screen = (
+                "<b>💳 Оплата</b>\n\n"
+                f"<b>Услуга:</b> {pricing.service_title(product)}\n"
+                f"<b>Стоимость:</b> {price} руб\n\n"
+                "Нажмите кнопку ниже — откроется оплата ЮKassa."
+            )
+        else:
+            pay_screen = (
+                "<b>💳 Реквизиты для оплаты</b>\n\n"
+                f"<b>Услуга:</b> {pricing.service_title(product)}\n"
+                f"<b>Стоимость:</b> {price} руб\n\n"
+                f"{dest}\n\n"
+                "После оплаты нажмите кнопку ниже."
+            )
         cid = message.chat.id
         mid = int(root_mid)
         s = await db.get_all_settings()
@@ -1874,7 +2160,7 @@ async def enter_brief(
                 chat_id=cid,
                 message_id=mid,
                 text=pay_screen,
-                reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                reply_markup=paid_kb(online=use_yk_btn),
                 is_photo=is_photo,
             )
         except TelegramBadRequest as e:
@@ -1885,7 +2171,7 @@ async def enter_brief(
                     message.bot,
                     chat_id=cid,
                     text=pay_screen,
-                    reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                    reply_markup=paid_kb(online=use_yk_btn),
                     photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1894,7 +2180,7 @@ async def enter_brief(
                 message.bot,
                 chat_id=cid,
                 text=pay_screen,
-                reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                reply_markup=paid_kb(online=use_yk_btn),
                 photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1909,33 +2195,60 @@ async def enter_contacts(
     message: Message, state: FSMContext, config: Config, db: Database, pricing: EffectivePricing
 ) -> None:
     raw = (message.text or "").strip()
+    data = await state.get_data()
+    pay_online = bool(data.get("pay_online"))
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    if len(lines) < 4:
-        warn = await message.answer(
-            "Нужно ровно 4 строки:\n"
-            "• имя\n"
-            "• фамилия\n"
-            "• банк (с какого будет оплата)\n"
-            "• @username в Telegram (или «—»)\n\n"
-            "Пример:\n"
-            "Иван\n"
-            "Иванов\n"
-            "Сбербанк\n"
-            "@nickname"
-        )
-        c = list(data.get("cleanup_ids", []))
-        c.extend([message.message_id, warn.message_id])
-        await state.update_data(cleanup_ids=c)
-        return
-    first_name, last_name, bank, tg_line = lines[0], lines[1], lines[2], lines[3]
-    user_name = f"{first_name} {last_name}".strip()
-    tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
-    if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
-        warn = await message.answer("Проверьте имя, фамилию и название банка (минимум 2 символа).")
-        c = list(data.get("cleanup_ids", []))
-        c.extend([message.message_id, warn.message_id])
-        await state.update_data(cleanup_ids=c)
-        return
+    if pay_online:
+        if len(lines) < 2:
+            warn = await message.answer(
+                "Нужно 2 строки:\n"
+                "• имя\n"
+                "• @username в Telegram (или «—»)\n\n"
+                "Пример:\n"
+                "Иван\n"
+                "@nickname"
+            )
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
+        first_name, tg_line = lines[0], lines[1]
+        user_name = first_name.strip()
+        bank = "—"
+        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+        if len(first_name) < 1:
+            warn = await message.answer("Укажите имя (непустая первая строка).")
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
+    else:
+        if len(lines) < 4:
+            warn = await message.answer(
+                "Нужно ровно 4 строки:\n"
+                "• имя\n"
+                "• фамилия\n"
+                "• банк (с какого будет оплата)\n"
+                "• @username в Telegram (или «—»)\n\n"
+                "Пример:\n"
+                "Иван\n"
+                "Иванов\n"
+                "Сбербанк\n"
+                "@nickname"
+            )
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
+        first_name, last_name, bank, tg_line = lines[0], lines[1], lines[2], lines[3]
+        user_name = f"{first_name} {last_name}".strip()
+        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+        if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
+            warn = await message.answer("Проверьте имя, фамилию и название банка (минимум 2 символа).")
+            c = list(data.get("cleanup_ids", []))
+            c.extend([message.message_id, warn.message_id])
+            await state.update_data(cleanup_ids=c)
+            return
     await state.update_data(name=user_name, phone=bank, tg_username=tg_u)
     await state.set_state(BookingStates.waiting_payment)
 
@@ -1943,7 +2256,6 @@ async def enter_contacts(
     product = data.get("product")
     if product not in ("no_engineer", "with_engineer"):
         return
-    dest = payment_destination_block_html(config)
     day = data.get("day")
     slot_text = data.get("slot_text")
     total = data.get("total")
@@ -1951,19 +2263,34 @@ async def enter_contacts(
     hours = len(slot_ids)
     svc_line = html_escape(str(data.get("tariff_label") or pricing.service_title(product)))
     tg_disp = f"@{html_escape(tg_u)}" if tg_u else "—"
-    screen2 = (
-        "<b>💳 Реквизиты для оплаты</b>\n\n"
-        f"<b>Услуга:</b> {svc_line}\n"
-        f"<b>Дата:</b> {day}\n"
-        f"<b>Время:</b> {slot_text}\n"
-        f"<b>Часов:</b> {hours}\n"
-        f"<b>Итого:</b> {total} руб\n\n"
-        f"{dest}\n\n"
-        f"<b>Данные:</b> {html_escape(user_name)}\n"
-        f"<b>Банк:</b> {html_escape(bank)}\n"
-        f"<b>Telegram:</b> {tg_disp}\n\n"
-        "После оплаты нажмите кнопку ниже."
-    )
+    use_yk_btn = bool(is_yookassa_configured(config) and pay_online)
+    if use_yk_btn:
+        screen2 = (
+            "<b>💳 Оплата</b>\n\n"
+            f"<b>Услуга:</b> {svc_line}\n"
+            f"<b>Дата:</b> {day}\n"
+            f"<b>Время:</b> {slot_text}\n"
+            f"<b>Часов:</b> {hours}\n"
+            f"<b>Итого:</b> {total} руб\n\n"
+            f"<b>Имя:</b> {html_escape(user_name)}\n"
+            f"<b>Telegram:</b> {tg_disp}\n\n"
+            "Нажмите кнопку ниже — откроется оплата ЮKassa."
+        )
+    else:
+        dest = payment_destination_block_html(config)
+        screen2 = (
+            "<b>💳 Реквизиты для оплаты</b>\n\n"
+            f"<b>Услуга:</b> {svc_line}\n"
+            f"<b>Дата:</b> {day}\n"
+            f"<b>Время:</b> {slot_text}\n"
+            f"<b>Часов:</b> {hours}\n"
+            f"<b>Итого:</b> {total} руб\n\n"
+            f"{dest}\n\n"
+            f"<b>Данные:</b> {html_escape(user_name)}\n"
+            f"<b>Банк:</b> {html_escape(bank)}\n"
+            f"<b>Telegram:</b> {tg_disp}\n\n"
+            "После оплаты нажмите кнопку ниже."
+        )
     root_mid = data.get("payment_root_message_id")
     is_photo = data.get("payment_root_is_photo", False)
     cid = message.chat.id
@@ -1976,7 +2303,7 @@ async def enter_contacts(
                 chat_id=cid,
                 message_id=int(root_mid),
                 text=screen2,
-                reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                reply_markup=paid_kb(online=use_yk_btn),
                 is_photo=is_photo,
             )
         except TelegramBadRequest as e:
@@ -1987,7 +2314,7 @@ async def enter_contacts(
                     message.bot,
                     chat_id=cid,
                     text=screen2,
-                    reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                    reply_markup=paid_kb(online=use_yk_btn),
                     photo_path=pay_path,
                 )
                 await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -1996,7 +2323,7 @@ async def enter_contacts(
                 message.bot,
                 chat_id=cid,
                 text=screen2,
-                reply_markup=paid_kb(online=is_yookassa_configured(config)),
+                reply_markup=paid_kb(online=use_yk_btn),
                 photo_path=pay_path,
             )
             await state.update_data(payment_root_message_id=new_id, payment_root_is_photo=new_ph)
@@ -2028,7 +2355,7 @@ async def paid(
     chat_id = callback.message.chat.id
     root_mid = data.get("payment_root_message_id")
     is_photo = bool(data.get("payment_root_is_photo", False))
-    use_yk = is_yookassa_configured(config)
+    use_yk = bool(is_yookassa_configured(config) and data.get("pay_online"))
 
     async def _edit_waiting() -> None:
         waiting = await append_manager_contact_html(
@@ -2561,7 +2888,7 @@ async def cancel_request_send(
         if not row:
             await callback.answer("Не удалось отменить заявку.", show_alert=True)
             return
-        await delete_booking_pending_ui_messages(callback.bot, snap)
+        await delete_booking_pending_ui_messages(callback.bot, snap, db)
         try:
             await _publish_weekly_and_tasks(callback.bot, db, config)
         except Exception:
@@ -2637,35 +2964,36 @@ async def cancel_request_send(
             f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
             f"<b>Сумма:</b> {booking['total_price']} руб"
         )
-    wait_tail = (
-        "Ожидайте решения оператора."
-        if bk in ("lyrics", "beat")
-        else "Ожидайте решения оператора. Слот пока занят."
-    )
-    wait = await append_manager_contact_html(
-        db,
-        "<b>⏳ Запрос на отмену отправлен</b>\n\n" + wait_tail,
-        config,
-    )
+    studio_wait = bk not in ("lyrics", "beat")
+    wait_body = await cancel_request_sent_body_html(db, studio=studio_wait)
+    wait = await append_manager_contact_html(db, wait_body, config)
+    uid = callback.from_user.id
+    act = await db.get_user_activity_message(uid)
     chat_id = callback.message.chat.id
     wait_mid = callback.message.message_id
-    try:
-        if getattr(callback.message, "photo", None):
-            await callback.message.edit_caption(
-                caption=_truncate_html(wait, 1024),
-                reply_markup=None,
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await callback.message.edit_text(
-                _truncate_html(wait, 4096),
-                reply_markup=None,
-                parse_mode=ParseMode.HTML,
-            )
-    except Exception:
-        sent = await callback.message.answer(wait, parse_mode=ParseMode.HTML)
-        wait_mid = sent.message_id
-        chat_id = sent.chat.id
+    if act:
+        await db.set_user_activity_notice(uid, wait)
+        await _render_user_activity_message(callback.bot, db, config, uid)
+        wait_mid = int(act["message_id"])
+        chat_id = int(act["chat_id"])
+    else:
+        try:
+            if getattr(callback.message, "photo", None):
+                await callback.message.edit_caption(
+                    caption=_truncate_html(wait, 1024),
+                    reply_markup=None,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await callback.message.edit_text(
+                    _truncate_html(wait, 4096),
+                    reply_markup=None,
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception:
+            sent = await callback.message.answer(wait, parse_mode=ParseMode.HTML)
+            wait_mid = sent.message_id
+            chat_id = sent.chat.id
     await db.update_booking_client_cleanup(
         booking_id,
         json.dumps(

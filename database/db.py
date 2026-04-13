@@ -144,6 +144,18 @@ class Database:
             await self._migrate_bookings_requires_engineer()
             await self._migrate_bookings_client_cleanup()
             await self._migrate_bookings_pending_meta()
+            await self._migrate_user_activity_notice()
+
+    async def _migrate_user_activity_notice(self) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            try:
+                await db.execute(
+                    "ALTER TABLE user_activity_message ADD COLUMN notice_html TEXT DEFAULT ''"
+                )
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
 
     async def _migrate_bookings_booked_slot_ids(self) -> None:
         async with self.connect() as db:
@@ -310,25 +322,51 @@ class Database:
         async with self.connect() as db:
             self._configure(db)
             cur = await db.execute(
-                "SELECT user_id, chat_id, message_id, body_html FROM user_activity_message WHERE user_id = ?",
+                """
+                SELECT user_id, chat_id, message_id, body_html,
+                       COALESCE(notice_html, '') AS notice_html
+                FROM user_activity_message WHERE user_id = ?
+                """,
                 (int(user_id),),
             )
             row = await cur.fetchone()
             return dict(row) if row else None
 
     async def upsert_user_activity_message(
-        self, user_id: int, chat_id: int, message_id: int, body_html: str
+        self, user_id: int, chat_id: int, message_id: int, body_html: str, *, notice_html: str | None = None
     ) -> None:
         async with self.connect() as db:
             self._configure(db)
+            eff_notice: str
+            if notice_html is None:
+                cur = await db.execute(
+                    "SELECT COALESCE(notice_html, '') FROM user_activity_message WHERE user_id = ?",
+                    (int(user_id),),
+                )
+                prev = await cur.fetchone()
+                eff_notice = str(prev[0]) if prev and prev[0] is not None else ""
+            else:
+                eff_notice = notice_html
             await db.execute(
                 """
-                INSERT OR REPLACE INTO user_activity_message(user_id, chat_id, message_id, body_html)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO user_activity_message(user_id, chat_id, message_id, body_html, notice_html)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (int(user_id), int(chat_id), int(message_id), body_html),
+                (int(user_id), int(chat_id), int(message_id), body_html, eff_notice or ""),
             )
             await db.commit()
+
+    async def set_user_activity_notice(self, user_id: int, notice_html: str) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute(
+                "UPDATE user_activity_message SET notice_html = ? WHERE user_id = ?",
+                (notice_html or "", int(user_id)),
+            )
+            await db.commit()
+
+    async def clear_user_activity_notice(self, user_id: int) -> None:
+        await self.set_user_activity_notice(user_id, "")
 
     async def delete_user_activity_message(self, user_id: int) -> None:
         async with self.connect() as db:

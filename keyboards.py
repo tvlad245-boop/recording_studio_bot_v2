@@ -265,6 +265,15 @@ def paid_kb(*, online: bool = False) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def payment_method_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 Онлайн (ЮKassa)", callback_data="paymeth:online")
+    kb.button(text="🏦 Перевод на карту / реквизиты", callback_data="paymeth:standard")
+    kb.button(text="⬅ В меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def my_booking_kb(booking_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="❌ Отменить запись", callback_data=f"book:cancel:{booking_id}")

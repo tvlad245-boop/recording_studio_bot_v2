@@ -29,6 +29,7 @@ from handlers.user import (
 from keyboards import month_calendar_kb, now_month
 from services.content_settings import (
     append_manager_contact_html,
+    cancel_confirmed_custom_html,
     cancel_refund_warning_html,
     effective_maker_username,
     equipment_photo_paths,
@@ -332,7 +333,14 @@ _CHANNEL_EDIT_PROMPTS: dict[str, tuple[str, str, str]] = {
 
 _CHANNEL_SETTING_KEYS = frozenset(v[0] for v in _CHANNEL_EDIT_PROMPTS.values())
 
-_CLIENT_TEXT_SETTING_KEYS = frozenset({"cancel_refund_warning_html"})
+_CLIENT_TEXT_SETTING_KEYS = frozenset(
+    {
+        "cancel_refund_warning_html",
+        "cancel_request_sent_html",
+        "cancel_confirmed_studio_html",
+        "cancel_confirmed_service_html",
+    }
+)
 
 _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
     "refund": (
@@ -340,6 +348,23 @@ _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
         "Предупреждение о возврате",
         "Текст показывается при отмене записи, если время аренды уже началось, и в сообщении клиенту после подтверждённой отмены в этом случае. "
         "Один символ <code>-</code> — взять текст по умолчанию из настроек бота.",
+    ),
+    "cancel_wait": (
+        "cancel_request_sent_html",
+        "Ожидание отмены (клиенту)",
+        "Показывается в главном окне после того, как клиент запросил отмену и ждёт решения оператора. "
+        "Пусто или <code>-</code> — стандартный текст. Контакт менеджера задаётся в разделе «Контакты».",
+    ),
+    "cancel_done_studio": (
+        "cancel_confirmed_studio_html",
+        "Отмена записи на студию (клиенту)",
+        "Текст после подтверждённой отмены записи на студию (до предупреждения о возврате и блока менеджера). "
+        "Пусто — как раньше: «Запись отменена», слот снова доступен.",
+    ),
+    "cancel_done_svc": (
+        "cancel_confirmed_service_html",
+        "Отмена заказа текст/бит (клиенту)",
+        "Текст после подтверждённой отмены заявки на текст или бит. Пусто — «Заявка отменена».",
     ),
 }
 
@@ -370,13 +395,18 @@ _CONTACT_PROMPTS: dict[str, tuple[str, str, str]] = {
 def _client_texts_admin_text() -> str:
     return (
         "<b>✉️ Тексты для клиентов</b>\n\n"
-        "• <b>Предупреждение о возврате</b> — если время аренды уже началось (см. также раздел «Контакты» для контактов)."
+        "• <b>Предупреждение о возврате</b> — если время аренды уже началось.\n"
+        "• <b>Ожидание отмены</b> — пока клиент ждёт решения по отмене (контакт менеджера — в «Контактах»).\n"
+        "• <b>Отмена: студия / текст·бит</b> — текст после подтверждённой отмены оператором."
     )
 
 
 def _client_texts_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⚠️ Предупреждение о возврате", callback_data="adtx:refund")
+    kb.button(text="⏳ Ожидание отмены", callback_data="adtx:cancel_wait")
+    kb.button(text="✅ Отмена: студия", callback_data="adtx:cancel_done_studio")
+    kb.button(text="✅ Отмена: текст/бит", callback_data="adtx:cancel_done_svc")
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -1673,7 +1703,7 @@ async def payment_reject(
     if not b or b.get("status") != "pending_payment":
         await callback.answer("Уже обработано", show_alert=True)
         return
-    await delete_booking_pending_ui_messages(callback.bot, dict(b))
+    await delete_booking_pending_ui_messages(callback.bot, dict(b), db)
     row = await db.cancel_booking(bid)
     if not row:
         await callback.answer("Ошибка отмены", show_alert=True)
@@ -1811,14 +1841,18 @@ async def user_cancellation_approve(
         )
     except Exception:
         pass
-    if kind in ("lyrics", "beat"):
-        lines = ["<b>Заявка отменена.</b>"]
+    custom = await cancel_confirmed_custom_html(db, kind)
+    if custom:
+        user_text = custom
     else:
-        lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
+        if kind in ("lyrics", "beat"):
+            lines = ["<b>Заявка отменена.</b>"]
+        else:
+            lines = ["<b>Запись отменена.</b>", "Слот снова доступен для бронирования."]
+        user_text = "\n\n".join(lines)
     warn = await cancel_refund_warning_html(db, config)
     if Database.booking_time_started(snap, timezone=config.timezone) and warn:
-        lines.append(warn)
-    user_text = "\n\n".join(lines)
+        user_text = f"{user_text}\n\n{warn}"
     user_text = await append_manager_contact_html(db, user_text, config)
     try:
         await delete_pending_ui_and_send_main_menu(

@@ -67,6 +67,9 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "cancel_refund_warning_html": (
             "<i>Если время аренды уже началось, возврат средств за эту запись не производится.</i>"
         ),
+        "cancel_request_sent_html": "",
+        "cancel_confirmed_studio_html": "",
+        "cancel_confirmed_service_html": "",
     }
     return d
 
