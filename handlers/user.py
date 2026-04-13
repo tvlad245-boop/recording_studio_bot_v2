@@ -23,6 +23,7 @@ from aiogram.types import (
     InputMediaPhoto,
     Message,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import Config
 from database.db import Database
@@ -2173,10 +2174,8 @@ async def paid(
                     parse_mode=ParseMode.HTML,
                     reply_markup=_yookassa_pay_url_kb(pay_url),
                 )
-            try:
-                await _publish_weekly_and_tasks(callback.bot, db, config)
-            except Exception:
-                pass
+            # Расписание/канал обновляем только после успешной оплаты (webhook/подтверждение),
+            # иначе в канале появятся изменения "до оплаты".
             await state.set_state(BookingStates.awaiting_payment_confirm)
             await state.update_data(paid_processing=False, pending_booking_id=order_id)
             await callback.answer("Откройте ссылку и оплатите")
@@ -2197,10 +2196,6 @@ async def paid(
                 reply_markup=_payment_review_kb(order_id),
             )
         await _edit_waiting()
-        try:
-            await _publish_weekly_and_tasks(callback.bot, db, config)
-        except Exception:
-            pass
         await state.set_state(BookingStates.awaiting_payment_confirm)
         await state.update_data(paid_processing=False, pending_booking_id=order_id)
         await callback.answer("Заявка отправлена на проверку")
@@ -2306,10 +2301,7 @@ async def paid(
                 parse_mode=ParseMode.HTML,
                 reply_markup=_yookassa_pay_url_kb(pay_url),
             )
-        try:
-            await _publish_weekly_and_tasks(callback.bot, db, config)
-        except Exception:
-            pass
+        # Расписание/канал обновляем только после успешной оплаты (webhook/подтверждение)
         await state.set_state(BookingStates.awaiting_payment_confirm)
         await state.update_data(paid_processing=False, pending_booking_id=booking_id)
         await callback.answer("Откройте ссылку и оплатите")
@@ -2330,10 +2322,6 @@ async def paid(
             reply_markup=_payment_review_kb(booking_id),
         )
     await _edit_waiting()
-    try:
-        await _publish_weekly_and_tasks(callback.bot, db, config)
-    except Exception:
-        pass
     await state.set_state(BookingStates.awaiting_payment_confirm)
     await state.update_data(paid_processing=False, pending_booking_id=booking_id)
     await callback.answer("Заявка отправлена на проверку")
