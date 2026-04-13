@@ -1360,7 +1360,7 @@ async def show_studio_mode(
 
 
 async def show_calendar(callback: CallbackQuery, state: FSMContext, db: Database, year: int | None = None, month: int | None = None) -> None:
-    available_days = set(await db.get_available_days(days_ahead=60))
+    available_days = set(await db.get_available_days())
     if year is None or month is None:
         year, month = now_month()
     await state.set_state(BookingStates.choosing_date)
@@ -1377,7 +1377,7 @@ async def show_calendar(callback: CallbackQuery, state: FSMContext, db: Database
         "<b>📅 Выберите дату записи</b>\n\n"
         "✅ — есть свободные слоты\n"
         "❌ — недоступно (прошлые даты, нет звукорежиссёра в этот день, день закрыт студией)\n\n"
-        "<i>Показываем доступность на ближайшие 60 дней.</i>",
+        "<i>Доступны даты с сегодня до конца следующего календарного месяца.</i>",
         reply_markup=month_calendar_kb(year, month, allowed_days=available_days, blocked_days=blocked),
     )
 
@@ -1399,7 +1399,6 @@ async def show_tariff_calendar(
         return
     require_engineer = product == "with_engineer"
     allowed = await db.get_days_with_free_tariff_block(
-        days_ahead=60,
         start_hhmm=start_hhmm,
         hour_count=hours,
         require_engineer=require_engineer,
@@ -3237,7 +3236,7 @@ async def reschedule_start(
         cal_year=y,
         cal_month=m,
     )
-    available_days = set(await db.get_available_days(days_ahead=60))
+    available_days = set(await db.get_available_days())
     if eng:
         available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(y, m)
@@ -3270,7 +3269,7 @@ async def reschedule_calendar_nav(
     y_str, m_str = payload.split("-")
     y, m = int(y_str), int(m_str)
     await state.update_data(cal_year=y, cal_month=m)
-    available_days = set(await db.get_available_days(days_ahead=60))
+    available_days = set(await db.get_available_days())
     data = await state.get_data()
     eng = bool(data.get("rs_engineer"))
     if eng:
@@ -3403,7 +3402,7 @@ async def reschedule_slot_back_calendar(
     eng = bool(data.get("rs_engineer"))
     await state.set_state(BookingStates.reschedule_pick_date)
     await state.update_data(rs_selected_slot_ids=[], rs_day=None)
-    available_days = set(await db.get_available_days(days_ahead=60))
+    available_days = set(await db.get_available_days())
     if eng:
         available_days = await db.filter_days_for_engineer_booking(available_days)
     closed_admin = await db.get_closed_days_in_month(y, m)

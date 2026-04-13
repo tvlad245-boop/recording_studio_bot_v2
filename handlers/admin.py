@@ -12,7 +12,7 @@ from aiogram import Router, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, InlineKeyboardMarkup
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -521,9 +521,72 @@ def _admin_prices_kb(pricing: EffectivePricing) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+_SCHED_MONTH_SHORT = (
+    "Янв",
+    "Фев",
+    "Мар",
+    "Апр",
+    "Май",
+    "Июн",
+    "Июл",
+    "Авг",
+    "Сен",
+    "Окт",
+    "Ноя",
+    "Дек",
+)
+
+_APPLY_STD_MONTH_INTRO_HTML = (
+    "<b>📆 Стандартное расписание на месяц</b>\n\n"
+    "Выберите месяц: для всех дней <b>не раньше сегодня</b> будет создана "
+    "обычная почасовая сетка (как при первом запуске бота). "
+    "Дни, закрытые через «Открыть/закрыть день», <b>не меняем</b>.\n\n"
+    "<b>Окно для клиентов:</b> только даты с сегодня до конца <b>следующего</b> "
+    "календарного месяца. Дальние месяцы заранее подготовьте здесь — когда подойдёт время, "
+    "они автоматически попадут в календарь.\n"
+)
+
+
+def _schedule_month_genitive_ru(month: int) -> str:
+    names = (
+        "января",
+        "февраля",
+        "марта",
+        "апреля",
+        "мая",
+        "июня",
+        "июля",
+        "августа",
+        "сентября",
+        "октября",
+        "ноября",
+        "декабря",
+    )
+    return names[month - 1] if 1 <= month <= 12 else str(month)
+
+
+def _apply_std_month_kb(year: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    names = _SCHED_MONTH_SHORT
+    for i in range(0, 12, 3):
+        for j in range(i, i + 3):
+            m = j + 1
+            kb.button(text=names[j], callback_data=f"schedympick:{year}-{m:02d}")
+        kb.adjust(3)
+    kb.row(
+        InlineKeyboardButton(text="◀", callback_data=f"schedyy:{year - 1}"),
+        InlineKeyboardButton(text=str(year), callback_data="noop"),
+        InlineKeyboardButton(text="▶", callback_data=f"schedyy:{year + 1}"),
+    )
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def admin_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🎛️ График звукорежиссёра", callback_data="admin:engineer_days")
+    kb.button(text="📆 Сетка на месяц (стандарт)", callback_data="admin:apply_std_month")
     kb.button(text="🔓🔒 Открыть / закрыть день", callback_data="admin:openclose_day")
     kb.button(text="➕ Добавить слот", callback_data="admin:add_slot")
     kb.button(text="➖ Удалить слот", callback_data="admin:remove_slot")
@@ -571,6 +634,99 @@ async def admin_home(callback: CallbackQuery, state: FSMContext, config: Config)
         return
     await state.clear()
     await _admin_edit_panel(callback, ADMIN_HOME_HTML, admin_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("schedyy:"))
+async def admin_schedule_year_nav(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        year = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    if year < 2000 or year > 2100:
+        await callback.answer("Год вне диапазона", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text(
+            _APPLY_STD_MONTH_INTRO_HTML,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_apply_std_month_kb(year),
+        )
+    except TelegramBadRequest:
+        await callback.message.edit_reply_markup(reply_markup=_apply_std_month_kb(year))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("schedympick:"))
+async def admin_schedule_month_confirm(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    payload = callback.data.split(":", maxsplit=1)[1]
+    try:
+        y_str, m_str = payload.split("-", maxsplit=1)
+        y, mo = int(y_str), int(m_str)
+    except (ValueError, AttributeError):
+        await callback.answer("Неверный формат", show_alert=True)
+        return
+    if mo < 1 or mo > 12:
+        await callback.answer("Неверный месяц", show_alert=True)
+        return
+    month_title = _schedule_month_genitive_ru(mo)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Применить сетку", callback_data=f"schedymrun:{y}-{mo:02d}")
+    kb.button(text="⬅ К месяцам", callback_data=f"schedyy:{y}")
+    kb.adjust(1)
+    await state.clear()
+    await _admin_edit_panel(
+        callback,
+        "<b>Подтверждение</b>\n\n"
+        f"Применить стандартную почасовую сетку на <b>{html_escape(month_title)} {y}</b>?\n"
+        "• только дни <b>с сегодня</b> и дальше в этом месяце;\n"
+        "• дни, закрытые через «Открыть/закрыть день», пропускаются.",
+        kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("schedymrun:"))
+async def admin_schedule_month_run(
+    callback: CallbackQuery, state: FSMContext, config: Config, db: Database
+) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    payload = callback.data.split(":", maxsplit=1)[1]
+    try:
+        y_str, m_str = payload.split("-", maxsplit=1)
+        y, mo = int(y_str), int(m_str)
+    except (ValueError, AttributeError):
+        await callback.answer("Неверный формат", show_alert=True)
+        return
+    if mo < 1 or mo > 12:
+        await callback.answer("Неверный месяц", show_alert=True)
+        return
+    n = await db.apply_standard_schedule_to_month(y, mo)
+    try:
+        await _publish_weekly_and_tasks(callback.bot, db, config)
+    except Exception:
+        logger.exception("_publish_weekly_and_tasks after apply_std_month")
+    await state.clear()
+    await _admin_edit_panel(
+        callback,
+        f"<b>Готово.</b> Обновлено дней: <b>{n}</b>.\n"
+        "<i>Если выбранный месяц целиком в прошлом — будет 0.</i>",
+        admin_menu_kb(),
+    )
     await callback.answer()
 
 
@@ -686,6 +842,13 @@ async def admin_actions(
             _contacts_admin_text(),
             _contacts_menu_kb(),
         )
+        await callback.answer()
+        return
+
+    if action == "apply_std_month":
+        await state.clear()
+        y = date.today().year
+        await _admin_edit_panel(callback, _APPLY_STD_MONTH_INTRO_HTML, _apply_std_month_kb(y))
         await callback.answer()
         return
 

@@ -446,15 +446,49 @@ class Database:
             r2 = await cur2.fetchone()
             return dict(r2) if r2 else None
 
-    async def seed_days(self, days_ahead: int) -> None:
+    @staticmethod
+    def booking_window_end_date(*, today: date | None = None) -> date:
         """
-        Создаёт рабочие дни и дефолтные слоты на N дней вперёд (включая сегодня).
+        Последний день, на который клиент может смотреть слоты: конец следующего календарного месяца.
+        Пример: 13 апреля → 31 мая; 1 мая → 30 июня; 15 декабря → 31 января (след. года).
         """
-        if days_ahead < 0:
-            days_ahead = 0
-        for i in range(days_ahead + 1):
-            d = (date.today() + timedelta(days=i)).isoformat()
-            await self.add_work_day(d)
+        t = today or date.today()
+        y, m = t.year, t.month
+        if m == 12:
+            ny, nm = y + 1, 1
+        else:
+            ny, nm = y, m + 1
+        _, dim = monthrange(ny, nm)
+        return date(ny, nm, dim)
+
+    async def seed_booking_window(self) -> None:
+        """Создаёт рабочие дни и почасовую сетку с сегодня до конца окна бронирования."""
+        today = date.today()
+        end = Database.booking_window_end_date(today=today)
+        d = today
+        while d <= end:
+            await self.add_work_day(d.isoformat())
+            d += timedelta(days=1)
+
+    async def apply_standard_schedule_to_month(self, year: int, month: int) -> int:
+        """
+        Проставляет стандартную почасовую сетку на все дни месяца, начиная с сегодня.
+        Пропускает прошлые даты и дни, закрытые через «Открыть/закрыть день».
+        Возвращает число дней, для которых вызывался add_work_day.
+        """
+        today = date.today()
+        _, dim = monthrange(year, month)
+        touched = 0
+        for dayn in range(1, dim + 1):
+            d = date(year, month, dayn)
+            if d < today:
+                continue
+            iso = d.isoformat()
+            if await self.is_work_day_closed(iso):
+                continue
+            await self.add_work_day(iso)
+            touched += 1
+        return touched
 
     async def add_work_day(self, day: str) -> None:
         """
@@ -671,12 +705,12 @@ class Database:
             )
             await db.commit()
 
-    async def get_available_days(self, *, days_ahead: int = 60) -> list[str]:
+    async def get_available_days(self) -> list[str]:
+        """Дни со свободными слотами в пределах окна бронирования (см. booking_window_end_date)."""
+        start_s = date.today().isoformat()
+        end_s = Database.booking_window_end_date().isoformat()
         async with self.connect() as db:
             self._configure(db)
-            if days_ahead < 0:
-                days_ahead = 0
-            until = f"+{days_ahead} day"
             cur = await db.execute(
                 """
                 SELECT DISTINCT ts.day
@@ -684,10 +718,11 @@ class Database:
                 JOIN work_days wd ON wd.day = ts.day
                 WHERE wd.is_closed = 0
                   AND ts.is_active = 1
-                  AND date(ts.day) BETWEEN date('now') AND date('now', ?)
+                  AND date(ts.day) >= date(?)
+                  AND date(ts.day) <= date(?)
                 ORDER BY ts.day
                 """,
-                (until,),
+                (start_s, end_s),
             )
             rows = await cur.fetchall()
             return [r["day"] for r in rows]
@@ -1514,7 +1549,6 @@ class Database:
     async def get_days_with_free_tariff_block(
         self,
         *,
-        days_ahead: int,
         start_hhmm: str,
         hour_count: int,
         require_engineer: bool,
@@ -1523,7 +1557,7 @@ class Database:
         Дни, где подряд есть hour_count свободных почасовых слотов с start_hhmm.
         require_engineer: только дни из графика звукорежиссёра (пн–пт + исключения в БД).
         """
-        base = set(await self.get_available_days(days_ahead=days_ahead))
+        base = set(await self.get_available_days())
         if require_engineer:
             base = await self.filter_days_for_engineer_booking(base)
         allowed: set[str] = set()

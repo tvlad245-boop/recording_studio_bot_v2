@@ -57,7 +57,7 @@ async def main() -> None:
     db = Database(cfg.db_path)
     await db.init()
     await db.ensure_settings_defaults(build_default_settings_dict(cfg))
-    await db.seed_days(60)
+    await db.seed_booking_window()
 
     scheduler = AsyncIOScheduler(timezone=cfg.timezone)
     scheduler.start()
