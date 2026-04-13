@@ -21,6 +21,19 @@ app = FastAPI(title="Studio bot — YooKassa webhook")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
+@app.get("/")
+async def root() -> dict[str, str]:
+    """
+    Некоторые прокси/хостинги (в т.ч. PaaS) могут «срезать» path и прокидывать в приложение только '/'.
+    Поэтому даём понятный ответ и используем '/' как алиас для webhook (POST).
+    """
+    return {
+        "status": "ok",
+        "service": "studio-bot",
+        "webhook": "/yookassa-webhook",
+        "note": "If your hosting strips path, YooKassa POST may arrive to '/'",
+    }
+
 @app.middleware("http")
 async def _log_all_requests(request: Request, call_next):
     """
@@ -33,8 +46,23 @@ async def _log_all_requests(request: Request, call_next):
     except Exception as e:
         preview = f"<failed to read body: {e}>"
 
-    if request.url.path.startswith("/yookassa-webhook"):
+    # Логируем всё, что приходит на webhook-роуты (и на '/', если хостинг режет path).
+    is_webhookish = request.url.path in ("/yookassa-webhook", "/") or request.url.path.startswith(
+        "/yookassa-webhook"
+    )
+    if is_webhookish:
         logger.warning("WEBHOOK RECEIVED %s %s", request.method, request.url.path)
+        # Иногда прокси передаёт оригинальный URL в заголовках — полезно увидеть.
+        for hk in (
+            "x-original-uri",
+            "x-forwarded-uri",
+            "x-rewrite-url",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+        ):
+            hv = request.headers.get(hk)
+            if hv:
+                logger.warning("WEBHOOK HDR %s: %s", hk, hv)
         if preview:
             logger.warning("WEBHOOK RAW BODY (preview): %s", preview)
         else:
@@ -42,7 +70,7 @@ async def _log_all_requests(request: Request, call_next):
 
     resp = await call_next(request)
 
-    if request.url.path.startswith("/yookassa-webhook"):
+    if is_webhookish:
         logger.warning("WEBHOOK RESP STATUS: %s", getattr(resp, "status_code", "?"))
     return resp
 
@@ -174,3 +202,10 @@ async def yookassa_webhook(request: Request) -> JSONResponse:
 
     payments.pop(pid, None)
     return JSONResponse({"ok": True})
+
+
+# Алиас: если хостинг/прокси режет path и YooKassa POST фактически приходит на '/',
+# мы всё равно обработаем событие.
+@app.post("/")
+async def yookassa_webhook_root_alias(request: Request) -> JSONResponse:
+    return await yookassa_webhook(request)
