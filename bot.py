@@ -5,6 +5,7 @@ import os
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramUnauthorizedError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import load_config
@@ -53,41 +54,51 @@ async def main() -> None:
 
     bot = Bot(token=cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-
-    db = Database(cfg.db_path)
-    await db.init()
-    await db.ensure_settings_defaults(build_default_settings_dict(cfg))
-    await db.seed_booking_window()
-
-    scheduler = AsyncIOScheduler(timezone=cfg.timezone)
-    scheduler.start()
-    reminder_service = ReminderService(
-        scheduler=scheduler, db=db, bot=bot, timezone=cfg.timezone
-    )
-    await reminder_service.restore_jobs()
-
-    register_pricing_middleware(user_router)
-    register_pricing_middleware(admin_router)
-
-    dp.include_router(user_router)
-    dp.include_router(admin_router)
-
-    set_payment_webhook_context(
-        bot=bot, db=db, cfg=cfg, reminder_service=reminder_service
-    )
-
-    # Снять webhook, если раньше бот работал через webhook — иначе long polling не стартует.
-    await bot.delete_webhook(drop_pending_updates=False)
-    _log.info(
-        "Запуск long polling. Если в логах «Conflict: other getUpdates» — с тем же токеном уже "
-        "крутится другой процесс (вторая консоль, VPS, systemd, PM2, тест на другой машине). "
-        "Остановите лишние копии; один бот = один активный polling."
-    )
-
-    async def _polling() -> None:
-        await dp.start_polling(bot, config=cfg, db=db, reminder_service=reminder_service)
+    scheduler = None
 
     try:
+        db = Database(cfg.db_path)
+        await db.init()
+        await db.ensure_settings_defaults(build_default_settings_dict(cfg))
+        await db.seed_booking_window()
+
+        scheduler = AsyncIOScheduler(timezone=cfg.timezone)
+        scheduler.start()
+        reminder_service = ReminderService(
+            scheduler=scheduler, db=db, bot=bot, timezone=cfg.timezone
+        )
+        await reminder_service.restore_jobs()
+
+        register_pricing_middleware(user_router)
+        register_pricing_middleware(admin_router)
+
+        dp.include_router(user_router)
+        dp.include_router(admin_router)
+
+        set_payment_webhook_context(
+            bot=bot, db=db, cfg=cfg, reminder_service=reminder_service
+        )
+
+        # Снять webhook, если раньше бот работал через webhook — иначе long polling не стартует.
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except TelegramUnauthorizedError:
+            _log.error(
+                "Telegram отклонил BOT_TOKEN (Unauthorized). Это не ошибка ЮKassa: "
+                "проверьте токен в панели хостинга (BOT_TOKEN / TELEGRAM_TOKEN), что он совпадает "
+                "с @BotFather (не отозван ли, нет ли кавычек, пробелов в начале/конце)."
+            )
+            raise SystemExit(1) from None
+
+        _log.info(
+            "Запуск long polling. Если в логах «Conflict: other getUpdates» — с тем же токеном уже "
+            "крутится другой процесс (вторая консоль, VPS, systemd, PM2, тест на другой машине). "
+            "Остановите лишние копии; один бот = один активный polling."
+        )
+
+        async def _polling() -> None:
+            await dp.start_polling(bot, config=cfg, db=db, reminder_service=reminder_service)
+
         if cfg.yookassa_shop_id and cfg.yookassa_secret_key:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
             # Bothost/PAAS часто задаёт порт через переменную PORT.
@@ -99,7 +110,8 @@ async def main() -> None:
         else:
             await _polling()
     finally:
-        scheduler.shutdown(wait=False)
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
         await bot.session.close()
 
 

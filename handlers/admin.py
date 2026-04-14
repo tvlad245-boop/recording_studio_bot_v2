@@ -133,9 +133,9 @@ def _engineer_admin_day_labels(
             day_num = 0
         works = Database.engineer_effective_works(iso, ex_map.get(iso))
         if iso in closed_days:
-            labels[iso] = f"⛔{day_num}"
+            labels[iso] = "❌"
         else:
-            labels[iso] = f"{'🎛' if works else '✖'}{day_num}"
+            labels[iso] = str(day_num) if works else "❌"
     return labels
 
 
@@ -145,7 +145,7 @@ _ENGINEER_CAL_HTML = (
     "в <b>сб–вс</b> — только без режиссёра (если студия открыта).\n\n"
     "Нажмите на число, чтобы <b>переключить</b> день для режиссёра "
     "(сделать выходным в будний или <b>рабочим в выходной</b>).\n\n"
-    "🎛 — со звукорежиссёром можно · ✖ — нельзя · ⛔ — день закрыт студией.\n"
+    "Число — со звукорежиссёром можно · ❌ — нельзя или день закрыт студией.\n"
 )
 
 
@@ -870,7 +870,7 @@ async def admin_actions(
     closed = await db.get_closed_days_in_month(y, m)
     await _admin_edit_panel(
         callback,
-        "<b>Выберите дату</b>\n⛔ — день сейчас закрыт (нажмите, чтобы открыть).",
+        "<b>Выберите дату</b>\n❌ — день сейчас закрыт (нажмите, чтобы открыть).",
         month_calendar_kb(
             y,
             m,
@@ -898,7 +898,7 @@ async def admin_calendar_nav(callback: CallbackQuery, state: FSMContext, db: Dat
     closed = await db.get_closed_days_in_month(y, m)
     try:
         await callback.message.edit_text(
-            "<b>Выберите дату</b>\n⛔ — день сейчас закрыт (нажмите, чтобы открыть).",
+            "<b>Выберите дату</b>\n❌ — день сейчас закрыт (нажмите, чтобы открыть).",
             parse_mode=ParseMode.HTML,
             reply_markup=month_calendar_kb(
                 y,

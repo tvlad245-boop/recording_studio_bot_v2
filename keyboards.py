@@ -148,16 +148,16 @@ def month_calendar_kb(
         current = date(year, month, day_num).isoformat()
         day_d = date(year, month, day_num)
         if mark_past_as_blocked and day_d < today_d:
-            btn = InlineKeyboardButton(text=f"❌{day_num}", callback_data="noop")
+            btn = InlineKeyboardButton(text="❌", callback_data="noop")
         elif blocked_days and current in blocked_days:
-            btn = InlineKeyboardButton(text=f"❌{day_num}", callback_data="noop")
+            btn = InlineKeyboardButton(text="❌", callback_data="noop")
         elif current in allowed_days:
             if custom_day_labels and current in custom_day_labels:
                 label = custom_day_labels[current]
             elif closed_days_highlight and current in closed_days_highlight:
-                label = f"⛔{day_num}"
+                label = "❌"
             else:
-                label = f"✅{day_num}"
+                label = str(day_num)
             btn = InlineKeyboardButton(text=label, callback_data=f"{prefix}:{current}")
         else:
             btn = InlineKeyboardButton(text=str(day_num), callback_data="noop")

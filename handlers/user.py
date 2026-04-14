@@ -1375,7 +1375,7 @@ async def show_calendar(callback: CallbackQuery, state: FSMContext, db: Database
     await _edit(
         callback.message,
         "<b>📅 Выберите дату записи</b>\n\n"
-        "✅ — есть свободные слоты\n"
+        "Число — есть свободные слоты\n"
         "❌ — недоступно (прошлые даты, нет звукорежиссёра в этот день, день закрыт студией)\n\n"
         "<i>Доступны даты с сегодня до конца следующего календарного месяца.</i>",
         reply_markup=month_calendar_kb(year, month, allowed_days=available_days, blocked_days=blocked),
@@ -1410,7 +1410,7 @@ async def show_tariff_calendar(
     caption = (
         f"<b>Ваше время: {st_label} — {end_label}</b>\n\n"
         "<b>📅 Выберите дату</b>\n\n"
-        "✅ — весь интервал свободен для брони\n"
+        "Число — весь интервал свободен для брони\n"
         "❌ — нельзя выбрать (прошлые дни, занято, день закрыт студией или нет звукорежиссёра)\n\n"
         "<i>После выбора даты блокируется весь указанный отрезок.</i>"
     )
@@ -3235,7 +3235,7 @@ async def reschedule_start(
     await _edit(
         callback.message,
         "<b>📅 Выберите новую дату</b>\n\n"
-        "✅ — есть свободные слоты под вашу длительность.",
+        "Число — есть свободные слоты под вашу длительность.",
         reply_markup=month_calendar_kb(
             y,
             m,
