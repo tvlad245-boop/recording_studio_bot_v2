@@ -124,6 +124,10 @@ def _month_days(year: int, month: int) -> set[str]:
 def _engineer_admin_day_labels(
     allowed_days: set[str], closed_days: set[str], ex_map: dict[str, str]
 ) -> dict[str, str]:
+    """
+    Подписи дат — у каждой кнопки свой текст (число или ×N / !N).
+    Несколько кнопок с одним и тем же «❌» на телефонах дают ложные нажатия / не срабатывают.
+    """
     labels: dict[str, str] = {}
     for iso in sorted(allowed_days):
         parts = iso.split("-")
@@ -133,9 +137,9 @@ def _engineer_admin_day_labels(
             day_num = 0
         works = Database.engineer_effective_works(iso, ex_map.get(iso))
         if iso in closed_days:
-            labels[iso] = "❌"
+            labels[iso] = f"!{day_num}"
         else:
-            labels[iso] = str(day_num) if works else "❌"
+            labels[iso] = str(day_num) if works else f"×{day_num}"
     return labels
 
 
@@ -404,7 +408,7 @@ _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
         "cancel_request_sent_html",
         "Ожидание отмены (клиенту)",
         "Показывается в главном окне после того, как клиент запросил отмену и ждёт решения оператора. "
-        "Пусто или <code>-</code> — стандартный текст. Контакт менеджера задаётся в разделе «Контакты».",
+        "Пусто или <code>-</code> — стандартный текст. Контакт менеджера — в «Контакты и реквизиты».",
     ),
     "cancel_done_studio": (
         "cancel_confirmed_studio_html",
@@ -419,7 +423,15 @@ _ADTX_PROMPTS: dict[str, tuple[str, str, str]] = {
     ),
 }
 
-_CONTACTS_SETTING_KEYS = frozenset({"textmaker_username", "beatmaker_username", "manager_contact_html"})
+_CONTACTS_SETTING_KEYS = frozenset(
+    {
+        "textmaker_username",
+        "beatmaker_username",
+        "manager_contact_html",
+        "payment_card_number",
+        "payment_card_recipient",
+    }
+)
 
 _CONTACT_PROMPTS: dict[str, tuple[str, str, str]] = {
     "textmaker": (
@@ -441,6 +453,19 @@ _CONTACT_PROMPTS: dict[str, tuple[str, str, str]] = {
         "запросе отмены и в итоговых сообщениях (без текста «ответьте на это сообщение»). "
         "<code>-</code> — очистить.",
     ),
+    "pay_card": (
+        "payment_card_number",
+        "Номер карты (для перевода)",
+        "Цифры карты одной строкой (можно с пробелами — как удобно клиенту). "
+        "Показывается на экране «перевод на карту». <code>-</code> — очистить. "
+        "Если не задано ни здесь, ни PAYMENT_DETAILS в .env — клиент увидит подсказку заполнить реквизиты.",
+    ),
+    "pay_recipient": (
+        "payment_card_recipient",
+        "Имя получателя (карта)",
+        "Как в приложении банка: ФИО или название получателя одной строкой. "
+        "Показывается вместе с номером карты при переводе. <code>-</code> — очистить.",
+    ),
 }
 
 
@@ -448,7 +473,7 @@ def _client_texts_admin_text() -> str:
     return (
         "<b>✉️ Тексты для клиентов</b>\n\n"
         "• <b>Предупреждение о возврате</b> — если время аренды уже началось.\n"
-        "• <b>Ожидание отмены</b> — пока клиент ждёт решения по отмене (контакт менеджера — в «Контактах»).\n"
+        "• <b>Ожидание отмены</b> — пока клиент ждёт решения по отмене (контакт менеджера — в «Контакты и реквизиты»).\n"
         "• <b>Отмена: студия / текст·бит</b> — текст после подтверждённой отмены оператором."
     )
 
@@ -464,12 +489,29 @@ def _client_texts_menu_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _contacts_admin_text() -> str:
+def _contacts_admin_text(settings: dict[str, str]) -> str:
+    card = (settings.get("payment_card_number") or "").strip()
+    who = (settings.get("payment_card_recipient") or "").strip()
+    if card and who:
+        pay_prev = (
+            f"<b>Карта для перевода:</b> <code>{html_escape(card)}</code>\n"
+            f"<b>Получатель:</b> {html_escape(who)}"
+        )
+    elif card:
+        pay_prev = f"<b>Карта для перевода:</b> <code>{html_escape(card)}</code>"
+    elif who:
+        pay_prev = f"<b>Получатель:</b> {html_escape(who)}"
+    else:
+        pay_prev = (
+            "<i>Номер карты и получатель не заданы — при переводе используется "
+            "PAYMENT_DETAILS из .env, если он есть.</i>"
+        )
     return (
-        "<b>📇 Контакты</b>\n\n"
-        "Контакты текстовика и битмейкера показываются в задачах в канале, в «Моих заявках» и в сводке после оплаты. "
+        "<b>📇 Контакты и реквизиты</b>\n\n"
+        "Контакты текстовика и битмейкера — в задачах в канале, в «Моих заявках» и в сводке после оплаты. "
         "Менеджер — HTML в сообщениях клиенту.\n"
-        "Пустое поле в боте = значение из .env."
+        "Пустое поле в боте = значение из .env.\n\n"
+        f"{pay_prev}"
     )
 
 
@@ -478,6 +520,8 @@ def _contacts_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="📝 Текстовик", callback_data="adct:textmaker")
     kb.button(text="🎚 Битмейкер", callback_data="adct:beatmaker")
     kb.button(text="👤 Менеджер (HTML)", callback_data="adct:manager")
+    kb.button(text="💳 Номер карты", callback_data="adct:pay_card")
+    kb.button(text="👤 Имя получателя (карта)", callback_data="adct:pay_recipient")
     kb.button(text="⬅ Админ-панель", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -538,14 +582,49 @@ _SCHED_MONTH_SHORT = (
 
 _APPLY_STD_MONTH_INTRO_HTML = (
     "<b>📆 Стандартное расписание на месяц</b>\n\n"
-    "Выберите месяц: для всех дней <b>не раньше сегодня</b> будет создана "
-    "обычная почасовая сетка (как при первом запуске бота). "
-    "Если день был <b>закрыт</b> через «Открыть/закрыть день», он будет "
-    "<b>открыт</b> и получит эту сетку.\n\n"
+    "<b>Как пользоваться (важно):</b>\n"
+    "1) Нажмите название месяца (например «Июн»).\n"
+    "2) Откроется экран <b>подтверждения</b> — там нужно нажать "
+    "<b>«Применить сетку»</b>. До этого слоты в базе не меняются.\n"
+    "<i>Это не календарь для ручной записи по часам — только массовая стандартная сетка.</i>\n\n"
+    "Для всех дней месяца <b>не раньше сегодня</b> будет создана обычная почасовая сетка "
+    "(как при первом запуске бота). Если день был <b>закрыт</b> через «Открыть/закрыть день», "
+    "он будет <b>открыт</b> и получит эту сетку.\n\n"
     "<b>Окно для клиентов:</b> только даты с сегодня до конца <b>следующего</b> "
     "календарного месяца. Дальние месяцы заранее подготовьте здесь — когда подойдёт время, "
     "они автоматически попадут в календарь.\n"
 )
+
+
+def _schedule_slots_hub_html() -> str:
+    return (
+        "<b>📅 Расписание и слоты</b>\n\n"
+        "Выберите подраздел.\n\n"
+        "• <b>График звукорежиссёра</b> — в какие дни можно записаться со звукарём (пн–пт по умолчанию, "
+        "исключения по датам).\n"
+        "• <b>Сетка на месяц</b> — массово создать стандартные почасовые слоты на выбранный месяц "
+        "(месяц → затем «Применить сетку»).\n"
+        "• <b>Открыть/закрыть день</b> — целиком закрыть студию на дату или снова открыть.\n"
+        "• <b>Добавить слот</b> — добавить один час в уже открытый день (например нестандартное время).\n"
+        "• <b>Удалить слот</b> — убрать один час из дня (если на нём нет активной брони).\n"
+        "• <b>Слот занят/свободен</b> — вручную пометить час «занят студией» без клиентской записи "
+        "(уборка, техника, резерв).\n"
+        "• <b>Расписание на дату</b> — просмотр всех слотов выбранного дня.\n"
+    )
+
+
+def _schedule_slots_hub_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎛️ График звукорежиссёра", callback_data="admin:engineer_days")
+    kb.button(text="📆 Сетка на месяц (стандарт)", callback_data="admin:apply_std_month")
+    kb.button(text="🔓🔒 Открыть / закрыть день", callback_data="admin:openclose_day")
+    kb.button(text="➕ Добавить слот", callback_data="admin:add_slot")
+    kb.button(text="➖ Удалить слот", callback_data="admin:remove_slot")
+    kb.button(text="🔁 Слот занят/свободен", callback_data="admin:toggle_slots")
+    kb.button(text="📋 Расписание на дату", callback_data="admin:schedule")
+    kb.button(text="⬅ Админ-панель", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def _schedule_month_genitive_ru(month: int) -> str:
@@ -586,14 +665,8 @@ def _apply_std_month_kb(year: int) -> InlineKeyboardMarkup:
 
 def admin_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎛️ График звукорежиссёра", callback_data="admin:engineer_days")
-    kb.button(text="📆 Сетка на месяц (стандарт)", callback_data="admin:apply_std_month")
-    kb.button(text="🔓🔒 Открыть / закрыть день", callback_data="admin:openclose_day")
-    kb.button(text="➕ Добавить слот", callback_data="admin:add_slot")
-    kb.button(text="➖ Удалить слот", callback_data="admin:remove_slot")
-    kb.button(text="🔁 Слот занят/свободен", callback_data="admin:toggle_slots")
+    kb.button(text="📅 Расписание и слоты", callback_data="admin:schedule_slots")
     kb.button(text="❌ Отменить запись клиента", callback_data="admin:cancel_booking")
-    kb.button(text="📋 Расписание на дату", callback_data="admin:schedule")
     kb.button(text="💰 Цены и тарифы", callback_data="admin:prices")
     kb.button(text="🛒 Услуги вкл/выкл", callback_data="admin:services")
     kb.button(text="📸 Оборудование и фото", callback_data="admin:equipment")
@@ -602,7 +675,7 @@ def admin_menu_kb():
     kb.button(text="🖼 Картинки интерфейса", callback_data="admin:ui_photos")
     kb.button(text="📡 Каналы и чаты", callback_data="admin:channels")
     kb.button(text="✉️ Тексты для клиентов", callback_data="admin:client_texts")
-    kb.button(text="📇 Контакты", callback_data="admin:contacts")
+    kb.button(text="📇 Контакты и реквизиты", callback_data="admin:contacts")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -696,7 +769,7 @@ async def admin_schedule_month_confirm(
         "• закрытые дни будут <b>открыты</b> и получат сетку.",
         kb.as_markup(),
     )
-    await callback.answer()
+    await callback.answer("Дальше нажмите «Применить сетку».", show_alert=False)
 
 
 @router.callback_query(F.data.startswith("schedymrun:"))
@@ -838,10 +911,21 @@ async def admin_actions(
 
     if action == "contacts":
         await state.clear()
+        s = await db.get_all_settings()
         await _admin_edit_panel(
             callback,
-            _contacts_admin_text(),
+            _contacts_admin_text(s),
             _contacts_menu_kb(),
+        )
+        await callback.answer()
+        return
+
+    if action == "schedule_slots":
+        await state.clear()
+        await _admin_edit_panel(
+            callback,
+            _schedule_slots_hub_html(),
+            _schedule_slots_hub_kb(),
         )
         await callback.answer()
         return
@@ -958,11 +1042,14 @@ async def admin_engineer_calendar_nav(callback: CallbackQuery, state: FSMContext
 async def admin_engineer_day_toggle(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     data = await state.get_data()
     if data.get("admin_action") != "engineer_days":
-        await callback.answer()
+        await callback.answer("Откройте «График звукорежиссёра» снова из админ-панели.", show_alert=True)
         return
     picked_day = callback.data.split(":", maxsplit=1)[1]
     if picked_day < date.today().isoformat():
-        await callback.answer("Прошедшие даты не меняем.", show_alert=True)
+        await callback.answer(
+            f"Дата {picked_day} уже прошла — график задним числом не меняем.",
+            show_alert=True,
+        )
         return
     await db.toggle_engineer_day_exception(picked_day)
     y = int(data.get("cal_year") or now_month()[0])
@@ -1943,11 +2030,12 @@ async def admin_wait_setting_text(
                 reply_markup=_admin_prices_kb(pricing2),
             )
         elif key in _CONTACTS_SETTING_KEYS:
+            s_ct = await db.get_all_settings()
             await _restore_admin_panel_message(
                 message.bot,
                 int(cid),
                 int(mid),
-                text=_contacts_admin_text(),
+                text=_contacts_admin_text(s_ct),
                 reply_markup=_contacts_menu_kb(),
             )
         else:

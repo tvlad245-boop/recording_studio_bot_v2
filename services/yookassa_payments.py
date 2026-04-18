@@ -37,15 +37,44 @@ def is_yookassa_configured(config: Config) -> bool:
     return bool(config.yookassa_shop_id and config.yookassa_secret_key)
 
 
-def payment_destination_block_html(config: Config) -> str:
-    """Блок «куда платить» для экрана оплаты: ЮKassa или реквизиты карты из .env."""
-    if is_yookassa_configured(config):
-        return (
-            "<b>Оплата онлайн:</b> после ввода контактов нажмите «Перейти к оплате» — "
-            "откроется страница ЮKassa (банковская карта)."
-        )
-    pay = (config.payment_details or "").strip().replace("\\n", "\n")
-    return f"<b>Куда отправить:</b>\n{html_escape(pay)}"
+def payment_destination_block_html(
+    config: Config,
+    *,
+    bank_transfer: bool = False,
+    settings: dict[str, str] | None = None,
+) -> str:
+    """
+    Блок «куда платить» для экрана оплаты.
+
+    bank_transfer=True — всегда реквизиты карты из .env (даже если ЮKassa включена).
+    Иначе при настроенной ЮKassa возвращается краткая подсказка про онлайн-оплату
+    (для обратной совместимости; для выбора «перевод на карту» всегда передавайте bank_transfer=True).
+
+    Если в settings заданы payment_card_number / payment_card_recipient (админка),
+    они показываются первыми; иначе используется PAYMENT_DETAILS из .env.
+    """
+    if bank_transfer or not is_yookassa_configured(config):
+        s = settings or {}
+        card = (s.get("payment_card_number") or "").strip()
+        holder = (s.get("payment_card_recipient") or "").strip()
+        if card or holder:
+            parts: list[str] = ["<b>Куда отправить:</b>"]
+            if card:
+                parts.append(f"<b>Номер карты:</b> <code>{html_escape(card)}</code>")
+            if holder:
+                parts.append(f"<b>Получатель:</b> {html_escape(holder)}")
+            return "\n".join(parts)
+        pay = (config.payment_details or "").strip().replace("\\n", "\n")
+        if not pay:
+            return (
+                "<b>Куда отправить:</b>\n"
+                "<i>Задайте номер и получателя в админке «Контакты и реквизиты» или PAYMENT_DETAILS в .env.</i>"
+            )
+        return f"<b>Куда отправить:</b>\n{html_escape(pay)}"
+    return (
+        "<b>Оплата онлайн:</b> после ввода контактов нажмите «Перейти к оплате» — "
+        "откроется страница ЮKassa (банковская карта)."
+    )
 
 
 async def create_payment(

@@ -64,6 +64,8 @@ def build_default_settings_dict(cfg: Config) -> dict[str, str]:
         "manager_contact_html": "",
         "textmaker_username": "",
         "beatmaker_username": "",
+        "payment_card_number": "",
+        "payment_card_recipient": "",
         "cancel_refund_warning_html": (
             "<i>Если время аренды уже началось, возврат средств за эту запись не производится.</i>"
         ),

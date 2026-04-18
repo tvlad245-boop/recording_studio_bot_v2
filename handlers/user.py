@@ -1845,7 +1845,7 @@ async def _send_studio_pay_contact_screen(
         )
     else:
         await state.set_state(BookingStates.entering_contacts)
-        dest = payment_destination_block_html(config)
+        dest = payment_destination_block_html(config, bank_transfer=True, settings=s)
         text = (
             "<b>💳 Реквизиты для оплаты</b>\n\n"
             f"{base_core}\n\n"
@@ -2176,7 +2176,7 @@ async def pay_method_chosen(
             "@nickname</i>"
         )
     else:
-        dest = payment_destination_block_html(config)
+        dest = payment_destination_block_html(config, bank_transfer=True, settings=s)
         screen = (
             "<b>💳 Реквизиты для оплаты</b>\n\n"
             f"{base_core}\n\n"
@@ -2296,7 +2296,6 @@ async def enter_brief(
     root_mid = data.get("payment_root_message_id")
     is_photo = data.get("payment_root_is_photo", False)
     if root_mid:
-        dest = payment_destination_block_html(config)
         use_yk_btn = bool(is_yookassa_configured(config) and pay_online)
         if use_yk_btn:
             pay_screen = (
@@ -2306,6 +2305,8 @@ async def enter_brief(
                 "Нажмите кнопку ниже — откроется оплата ЮKassa."
             )
         else:
+            s_pay = await db.get_all_settings()
+            dest = payment_destination_block_html(config, bank_transfer=True, settings=s_pay)
             pay_screen = (
                 "<b>💳 Реквизиты для оплаты</b>\n\n"
                 f"<b>Услуга:</b> {pricing.service_title(product)}\n"
@@ -2440,7 +2441,8 @@ async def enter_contacts(
             "Нажмите кнопку ниже — откроется оплата ЮKassa."
         )
     else:
-        dest = payment_destination_block_html(config)
+        s_dest = await db.get_all_settings()
+        dest = payment_destination_block_html(config, bank_transfer=True, settings=s_dest)
         screen2 = (
             "<b>💳 Реквизиты для оплаты</b>\n\n"
             f"<b>Услуга:</b> {svc_line}\n"
