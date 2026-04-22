@@ -151,6 +151,18 @@ class Database:
             await self._migrate_bookings_client_cleanup()
             await self._migrate_bookings_pending_meta()
             await self._migrate_user_activity_notice()
+            await self._migrate_bookings_yclients_record_id()
+
+    async def _migrate_bookings_yclients_record_id(self) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            try:
+                await db.execute(
+                    "ALTER TABLE bookings ADD COLUMN yclients_record_id INTEGER"
+                )
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
 
     async def _migrate_user_activity_notice(self) -> None:
         async with self.connect() as db:
@@ -1054,6 +1066,18 @@ class Database:
 
             await db.commit()
             return int(booking_cur.lastrowid)
+
+    async def set_booking_yclients_record_id(
+        self, booking_id: int, record_id: int | None
+    ) -> None:
+        """Связь локальной брони с записью в Yclients (после успешного POST /records)."""
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute(
+                "UPDATE bookings SET yclients_record_id = ? WHERE id = ?",
+                (record_id, booking_id),
+            )
+            await db.commit()
 
     async def create_service_order(
         self,

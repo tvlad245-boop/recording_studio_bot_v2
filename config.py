@@ -72,6 +72,14 @@ class Config:
     yookassa_secret_key: str
     yookassa_return_url: str
 
+    # Yclients REST API (https://developers.yclients.com). company_id=0 — интеграция выключена.
+    yclients_partner_token: str
+    yclients_user_token: str
+    yclients_company_id: int
+    yclients_default_staff_id: int
+    # Через запятую: id услуг для book_times (для проверки и будущего бронирования), например "12345"
+    yclients_service_ids_csv: str
+
 
 def payments_inbox_chat_id(cfg: Config) -> int:
     return cfg.payments_chat_id if cfg.payments_chat_id else cfg.admin_id
@@ -223,6 +231,12 @@ def load_config() -> Config:
         os.getenv("YOOKASSA_RETURN_URL", "").strip() or "https://yookassa.ru"
     )
 
+    yclients_partner_token = _env_first("YCLIENTS_PARTNER_TOKEN", "YCLIENTS_APP_PARTNER_TOKEN")
+    yclients_user_token = _env_first("YCLIENTS_USER_TOKEN", "YCLIENTS_APP_USER_TOKEN")
+    yclients_company_id = _int_env("YCLIENTS_COMPANY_ID", 0)
+    yclients_default_staff_id = _int_env("YCLIENTS_DEFAULT_STAFF_ID", 0)
+    yclients_service_ids_csv = os.getenv("YCLIENTS_SERVICE_IDS", "").strip()
+
     return Config(
         bot_token=token,
         admin_id=admin_id,
@@ -267,5 +281,10 @@ def load_config() -> Config:
         yookassa_shop_id=yookassa_shop_id,
         yookassa_secret_key=yookassa_secret_key,
         yookassa_return_url=yookassa_return_url,
+        yclients_partner_token=yclients_partner_token,
+        yclients_user_token=yclients_user_token,
+        yclients_company_id=yclients_company_id,
+        yclients_default_staff_id=yclients_default_staff_id,
+        yclients_service_ids_csv=yclients_service_ids_csv,
     )
 
