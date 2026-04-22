@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import socket
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -19,6 +20,27 @@ from services.webhook_context import set_payment_webhook_context
 from yookassa_webhook import app as yookassa_webhook_app
 
 
+def _pick_free_tcp_port(*, preferred: int, span: int = 48) -> int:
+    """
+    Первый свободный порт начиная с preferred (0.0.0.0), чтобы не падать с Errno 98,
+    если 8080 уже занят другим процессом в контейнере.
+    """
+    last = preferred + max(span, 1)
+    for port in range(preferred, last):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    raise RuntimeError(
+        f"Не найден свободный TCP-порт в диапазоне {preferred}..{last - 1} для ЮKassa webhook"
+    )
+
+
 async def _run_yookassa_uvicorn(host: str, port: int) -> None:
     import uvicorn
 
@@ -33,6 +55,35 @@ async def _run_yookassa_uvicorn(host: str, port: int) -> None:
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+async def _yookassa_webhook_background(host: str, port: int, log: logging.Logger) -> None:
+    """
+    Uvicorn при ошибке bind часто вызывает sys.exit(1) — это SystemExit.
+    В asyncio.gather() это роняет весь процесс и polling не стартует.
+    Здесь глотаем SystemExit/OSError: бот остаётся в polling, webhook просто не работает.
+    """
+    try:
+        await _run_yookassa_uvicorn(host, port)
+    except asyncio.CancelledError:
+        raise
+    except SystemExit as e:
+        exc_code = e.args[0] if e.args else "?"
+        log.error(
+            "ЮKassa webhook (uvicorn) завершился с SystemExit(%s) на порту %s — "
+            "часто это «address already in use». Задайте свободный WEBHOOK_PORT или освободите порт. "
+            "Бот продолжает работу в polling; автоподтверждение оплат по webhook недоступно.",
+            exc_code,
+            port,
+        )
+    except OSError as e:
+        log.error(
+            "ЮKassa webhook: порт %s — %s. Бот в polling работает; webhook отключён.",
+            port,
+            e,
+        )
+    except Exception:
+        log.exception("ЮKassa webhook: неожиданная ошибка; бот в polling продолжает работу.")
 
 
 async def main() -> None:
@@ -101,12 +152,40 @@ async def main() -> None:
 
         if cfg.yookassa_shop_id and cfg.yookassa_secret_key:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
-            # Bothost/PAAS часто задаёт порт через переменную PORT.
-            wh_port = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")))
-            await asyncio.gather(
-                _polling(),
-                _run_yookassa_uvicorn(wh_host, wh_port),
+            wp_raw = os.getenv("WEBHOOK_PORT", "").strip()
+            port_raw = os.getenv("PORT", "").strip()
+            if wp_raw.isdigit():
+                preferred = int(wp_raw)
+            elif port_raw.isdigit():
+                preferred = int(port_raw)
+            else:
+                preferred = 8080
+            wh_port = _pick_free_tcp_port(preferred=preferred)
+            if wh_port != preferred:
+                _log.warning(
+                    "Порт %s занят — для ЮKassa выбран свободный %s. "
+                    "Обновите проброс портов в Docker / upstream nginx, если трафик шёл на %s.",
+                    preferred,
+                    wh_port,
+                    preferred,
+                )
+            _log.info(
+                "ЮKassa webhook HTTP: http://%s:%s/yookassa-webhook",
+                wh_host,
+                wh_port,
             )
+            yk_task = asyncio.create_task(
+                _yookassa_webhook_background(wh_host, wh_port, _log),
+                name="yookassa-uvicorn",
+            )
+            try:
+                await _polling()
+            finally:
+                yk_task.cancel()
+                try:
+                    await yk_task
+                except asyncio.CancelledError:
+                    pass
         else:
             await _polling()
     finally:
