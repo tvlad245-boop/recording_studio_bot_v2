@@ -7,6 +7,7 @@ from datetime import date
 from html import escape as html_escape
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.enums import ParseMode
@@ -55,6 +56,7 @@ from states import AdminStates
 
 router = Router()
 logger = logging.getLogger(__name__)
+_BOOT_UTC = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 ADMIN_HOME_HTML = "<b>🛠 Админ-панель</b>"
 
@@ -683,6 +685,7 @@ def admin_menu_kb():
     kb.button(text="✉️ Тексты для клиентов", callback_data="admin:client_texts")
     kb.button(text="📇 Контакты и реквизиты", callback_data="admin:contacts")
     kb.button(text="🔌 Проверка Yclients", callback_data="admin:yclients_ping")
+    kb.button(text="ℹ️ Версия", callback_data="admin:version")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -988,6 +991,14 @@ async def admin_actions(
                 await callback.message.answer(f"Yclients OK. {html_escape(tail)}", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
+        return
+
+    if action == "version":
+        await state.clear()
+        bid = (getattr(config, "build_id", "") or "dev").strip()
+        # В alert ограничение по длине, поэтому коротко.
+        msg = f"Build: {bid}\nBoot(UTC): {_BOOT_UTC}"
+        await callback.answer(msg[:190], show_alert=True)
         return
 
     if action == "schedule_slots":
