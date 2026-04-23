@@ -954,11 +954,25 @@ async def admin_actions(
             )
         except YclientsError as e:
             msg = str(e)[:180]
-            await callback.answer(f"Yclients: {msg}", show_alert=True)
+            try:
+                await callback.answer(f"Yclients: {msg}", show_alert=True)
+            except Exception:
+                try:
+                    await callback.message.answer(f"Yclients: {html_escape(msg)}", parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
             return
         except Exception as e:
             logger.exception("yclients_ping failed")
-            await callback.answer(f"Yclients: ошибка запроса ({type(e).__name__})", show_alert=True)
+            try:
+                await callback.answer(f"Yclients: ошибка запроса ({type(e).__name__})", show_alert=True)
+            except Exception:
+                try:
+                    await callback.message.answer(
+                        f"Yclients: ошибка запроса ({html_escape(type(e).__name__)})", parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
             return
         n = len(slots)
         preview = ", ".join(str(x.get("time", "?")) for x in slots[:8])
@@ -967,7 +981,13 @@ async def admin_actions(
         tail = f" Интервалов: {n}. {preview}".strip()
         if len(tail) > 190:
             tail = tail[:187] + "…"
-        await callback.answer(f"Yclients OK.{tail}", show_alert=True)
+        try:
+            await callback.answer(f"Yclients OK. {tail}", show_alert=True)
+        except Exception:
+            try:
+                await callback.message.answer(f"Yclients OK. {html_escape(tail)}", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
         return
 
     if action == "schedule_slots":

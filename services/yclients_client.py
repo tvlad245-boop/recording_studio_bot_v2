@@ -123,8 +123,15 @@ async def yclients_book_times(
             params.append(("service_ids[]", str(int(sid))))
 
     headers = _default_headers(cfg)
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        r = await client.get(url, headers=headers, params=params or None)
+    # Короткий таймаут, чтобы админ-кнопка не «висела» бесконечно.
+    timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers, params=params or None)
+    except httpx.TimeoutException as e:
+        raise YclientsError("Timeout при запросе в Yclients (проверьте доступ к api.yclients.com с сервера).") from e
+    except httpx.HTTPError as e:
+        raise YclientsError(f"HTTP ошибка при запросе в Yclients: {type(e).__name__}") from e
 
     if r.status_code >= 400:
         logger.warning("yclients book_times HTTP %s: %s", r.status_code, r.text[:500])
