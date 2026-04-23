@@ -938,12 +938,17 @@ async def admin_actions(
         except Exception:
             pass
         if not yclients_is_configured(config):
-            await callback.answer(
-                "В .env задайте YCLIENTS_COMPANY_ID и хотя бы один токен. "
-                "Для POST /records нужны оба: YCLIENTS_PARTNER_TOKEN и YCLIENTS_USER_TOKEN. "
-                "Опционально YCLIENTS_SERVICE_IDS и YCLIENTS_DEFAULT_STAFF_ID (0 = любой).",
-                show_alert=True,
-            )
+            try:
+                await callback.message.answer(
+                    "Yclients: интеграция не настроена.\n\n"
+                    "В .env задайте:\n"
+                    "• YCLIENTS_COMPANY_ID\n"
+                    "• YCLIENTS_USER_TOKEN (или YCLIENTS_PARTNER_TOKEN)\n"
+                    "Опционально: YCLIENTS_SERVICE_IDS, YCLIENTS_DEFAULT_STAFF_ID\n\n"
+                    "Важно: в токены вставляйте только сами значения, без 'Bearer'/'User'."
+                )
+            except Exception:
+                pass
             return
         today = date.today().isoformat()
         staff = int(config.yclients_default_staff_id or 0)
@@ -958,24 +963,19 @@ async def admin_actions(
         except YclientsError as e:
             msg = str(e)[:180]
             try:
-                await callback.answer(f"Yclients: {msg}", show_alert=True)
+                await callback.message.answer(f"Yclients: {html_escape(msg)}", parse_mode=ParseMode.HTML)
             except Exception:
-                try:
-                    await callback.message.answer(f"Yclients: {html_escape(msg)}", parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
+                pass
             return
         except Exception as e:
             logger.exception("yclients_ping failed")
             try:
-                await callback.answer(f"Yclients: ошибка запроса ({type(e).__name__})", show_alert=True)
+                await callback.message.answer(
+                    f"Yclients: ошибка запроса ({html_escape(type(e).__name__)})",
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception:
-                try:
-                    await callback.message.answer(
-                        f"Yclients: ошибка запроса ({html_escape(type(e).__name__)})", parse_mode=ParseMode.HTML
-                    )
-                except Exception:
-                    pass
+                pass
             return
         n = len(slots)
         preview = ", ".join(str(x.get("time", "?")) for x in slots[:8])
@@ -985,12 +985,9 @@ async def admin_actions(
         if len(tail) > 190:
             tail = tail[:187] + "…"
         try:
-            await callback.answer(f"Yclients OK. {tail}", show_alert=True)
+            await callback.message.answer(f"Yclients OK. {html_escape(tail)}", parse_mode=ParseMode.HTML)
         except Exception:
-            try:
-                await callback.message.answer(f"Yclients OK. {html_escape(tail)}", parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+            pass
         return
 
     if action == "version":
