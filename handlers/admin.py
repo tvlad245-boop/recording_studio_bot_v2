@@ -929,6 +929,11 @@ async def admin_actions(
 
     if action == "yclients_ping":
         await state.clear()
+        # Сразу отвечаем, чтобы в Telegram не висели «часики» при долгом HTTP.
+        try:
+            await callback.answer("Проверяю Yclients…")
+        except Exception:
+            pass
         if not yclients_is_configured(config):
             await callback.answer(
                 "В .env задайте YCLIENTS_COMPANY_ID и хотя бы один токен. "
@@ -950,6 +955,10 @@ async def admin_actions(
         except YclientsError as e:
             msg = str(e)[:180]
             await callback.answer(f"Yclients: {msg}", show_alert=True)
+            return
+        except Exception as e:
+            logger.exception("yclients_ping failed")
+            await callback.answer(f"Yclients: ошибка запроса ({type(e).__name__})", show_alert=True)
             return
         n = len(slots)
         preview = ", ".join(str(x.get("time", "?")) for x in slots[:8])
