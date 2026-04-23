@@ -36,15 +36,50 @@ def yclients_is_configured(cfg: Config) -> bool:
 
 
 def _auth_header(cfg: Config) -> str:
-    p = (cfg.yclients_partner_token or "").strip()
-    u = (cfg.yclients_user_token or "").strip()
+    def _clean_token(raw: str) -> str:
+        """
+        Пользователи часто вставляют в .env не «чистый» токен, а кусок заголовка:
+        'Bearer XXX, User YYY' или 'User YYY'. Здесь вычищаем префиксы и мусор.
+        """
+        s = (raw or "").strip().strip("\ufeff")
+        # Неразрывные пробелы и прочий «копипаст» мусор
+        s = s.replace("\u00a0", " ").replace("\u2007", " ").replace("\u202f", " ").strip()
+        # Убрать кавычки вокруг значения
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+        low = s.lower()
+        if low.startswith("authorization:"):
+            s = s.split(":", 1)[1].strip()
+            low = s.lower()
+        if low.startswith("bearer "):
+            s = s[7:].strip()
+            low = s.lower()
+        if low.startswith("user "):
+            s = s[5:].strip()
+        return s
+
+    p = _clean_token(cfg.yclients_partner_token or "")
+    u = _clean_token(cfg.yclients_user_token or "")
     if p and u:
-        return f"Bearer {p}, User {u}"
-    if p:
-        return f"Bearer {p}"
-    if u:
-        return f"Bearer {u}"
-    return ""
+        auth = f"Bearer {p}, User {u}"
+    elif p:
+        auth = f"Bearer {p}"
+    elif u:
+        auth = f"Bearer {u}"
+    else:
+        return ""
+
+    # httpx требует ASCII для заголовков; если в токен попали русские буквы — дадим понятную ошибку.
+    try:
+        auth.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise YclientsError(
+            "Токен(ы) Yclients содержат не-ASCII символы. "
+            "В .env нужно вставлять только сам токен (латиница/цифры/символы), "
+            "без слов 'Bearer'/'User' и без русских букв/кавычек."
+        ) from e
+
+    return auth
 
 
 def _default_headers(cfg: Config) -> dict[str, str]:
