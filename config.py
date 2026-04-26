@@ -79,6 +79,8 @@ class Config:
     yclients_default_staff_id: int
     # Через запятую: id услуг для book_times (для проверки и будущего бронирования), например "12345"
     yclients_service_ids_csv: str
+    # 1 = почасовая запись и слоты из Yclients (book_times + POST /records), иначе только локальная SQLite сетка.
+    yclients_studio: bool
 
     # Идентификатор сборки/деплоя (для проверки обновлений в админке).
     # Рекомендуется задавать в окружении (CI/CD): BUILD_ID или GIT_SHA.
@@ -240,6 +242,14 @@ def load_config() -> Config:
     yclients_company_id = _int_env("YCLIENTS_COMPANY_ID", 0)
     yclients_default_staff_id = _int_env("YCLIENTS_DEFAULT_STAFF_ID", 0)
     yclients_service_ids_csv = os.getenv("YCLIENTS_SERVICE_IDS", "").strip()
+    # YCLIENTS_STUDIO=1 — календарь/слоты для «Почасовой записи» с CRM Yclients
+    yclients_studio = (os.getenv("YCLIENTS_STUDIO", "0") or "0").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
     build_id = _env_first("BUILD_ID", "GIT_SHA", "RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT_SHA") or "dev"
 
     return Config(
@@ -291,6 +301,7 @@ def load_config() -> Config:
         yclients_company_id=yclients_company_id,
         yclients_default_staff_id=yclients_default_staff_id,
         yclients_service_ids_csv=yclients_service_ids_csv,
+        yclients_studio=yclients_studio,
         build_id=build_id,
     )
 

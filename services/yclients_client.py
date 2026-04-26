@@ -168,8 +168,8 @@ async def yclients_create_record(
     """
     if not cfg.yclients_company_id:
         raise YclientsError("YCLIENTS_COMPANY_ID не задан")
-    if not (cfg.yclients_partner_token and cfg.yclients_user_token):
-        raise YclientsError("Для создания записи нужны оба токена: partner и user (см. документацию records)")
+    if not (cfg.yclients_partner_token or cfg.yclients_user_token):
+        raise YclientsError("Задайте YCLIENTS_PARTNER_TOKEN и/или YCLIENTS_USER_TOKEN (как для book_times)")
 
     url = f"{YCLIENTS_API_BASE}/records/{int(cfg.yclients_company_id)}"
     body: dict[str, Any] = {

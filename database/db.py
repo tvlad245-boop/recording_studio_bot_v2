@@ -1067,6 +1067,71 @@ class Database:
             await db.commit()
             return int(booking_cur.lastrowid)
 
+    async def create_booking_studio_yclients(
+        self,
+        *,
+        user_id: int,
+        user_name: str,
+        phone: str,
+        tg_username: str | None,
+        requires_engineer: bool,
+        day: str,
+        start_time: str,
+        end_time: str,
+        booked_slot_ids_csv: str,
+        services: str,
+        total_price: int,
+        status: str = "active",
+        yclients_record_id: int | None = None,
+    ) -> int | None:
+        """
+        Бронь на студию без слотов SQLite (расписание в Yclients).
+        """
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT 1 FROM bookings
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
+                )
+                  AND (booking_kind IS NULL OR booking_kind = 'studio')
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                return None
+            booking_cur = await db.execute(
+                """
+                INSERT INTO bookings(
+                    user_id, user_name, phone, day, start_time, end_time, services, total_price, status, created_at,
+                    booked_slot_ids, booking_kind, notes, tg_username, requires_engineer, yclients_record_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'studio', NULL, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    user_name,
+                    phone,
+                    day,
+                    start_time,
+                    end_time,
+                    services,
+                    total_price,
+                    status,
+                    datetime.utcnow().isoformat(),
+                    booked_slot_ids_csv,
+                    tg_username,
+                    1 if requires_engineer else 0,
+                    yclients_record_id,
+                ),
+            )
+            await db.commit()
+            return int(booking_cur.lastrowid)
+
     async def set_booking_yclients_record_id(
         self, booking_id: int, record_id: int | None
     ) -> None:
