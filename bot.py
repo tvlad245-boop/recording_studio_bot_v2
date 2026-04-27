@@ -18,6 +18,7 @@ from services.pricing_middleware import register_pricing_middleware
 from services.reminders import ReminderService
 from services.webhook_context import set_payment_webhook_context
 from yookassa_webhook import app as yookassa_webhook_app
+from services.yclients_studio import yclients_studio_enabled
 
 
 def _pick_free_tcp_port(*, preferred: int, span: int = 48) -> int:
@@ -150,7 +151,15 @@ async def main() -> None:
         async def _polling() -> None:
             await dp.start_polling(bot, config=cfg, db=db, reminder_service=reminder_service)
 
-        if cfg.yookassa_shop_id and cfg.yookassa_secret_key:
+        # HTTP вебхуки в этом же процессе:
+        # - ЮKassa (если настроена)
+        # - Yclients (если включён режим студии из CRM или задан token)
+        yclients_token = (os.getenv("YCLIENTS_WEBHOOK_TOKEN", "").strip() or os.getenv("YCLIENTS_WEBHOOK_SECRET", "").strip())
+        need_http_webhook = bool(cfg.yookassa_shop_id and cfg.yookassa_secret_key) or bool(
+            yclients_studio_enabled(cfg) or yclients_token
+        )
+
+        if need_http_webhook:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
             wp_raw = os.getenv("WEBHOOK_PORT", "").strip()
             port_raw = os.getenv("PORT", "").strip()
@@ -170,7 +179,7 @@ async def main() -> None:
                     preferred,
                 )
             _log.info(
-                "ЮKassa webhook HTTP: http://%s:%s/yookassa-webhook",
+                "Webhook HTTP: http://%s:%s (ЮKassa: /yookassa-webhook, Yclients: /yclients-webhook)",
                 wh_host,
                 wh_port,
             )
