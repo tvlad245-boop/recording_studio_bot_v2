@@ -41,6 +41,22 @@ def _pick_free_tcp_port(*, preferred: int, span: int = 48) -> int:
         f"Не найден свободный TCP-порт в диапазоне {preferred}..{last - 1} для ЮKassa webhook"
     )
 
+def _effective_webhook_port(*, default: int = 8080) -> int:
+    """
+    В PaaS (в т.ч. bothost) наружный прокси часто ждёт, что процесс слушает РОВНО port из env PORT.
+    Поэтому:
+    - если задан WEBHOOK_PORT — это явное желание слушать его (и можно автоподобрать следующий свободный);
+    - иначе, если задан PORT — слушаем его строго, без сканирования;
+    - иначе — дефолт 8080 + автоподбор свободного.
+    """
+    wp_raw = os.getenv("WEBHOOK_PORT", "").strip()
+    port_raw = os.getenv("PORT", "").strip()
+    if wp_raw.isdigit():
+        preferred = int(wp_raw)
+        return _pick_free_tcp_port(preferred=preferred)
+    if port_raw.isdigit():
+        return int(port_raw)
+    return _pick_free_tcp_port(preferred=default)
 
 async def _run_yookassa_uvicorn(host: str, port: int) -> None:
     import uvicorn
@@ -161,23 +177,7 @@ async def main() -> None:
 
         if need_http_webhook:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
-            wp_raw = os.getenv("WEBHOOK_PORT", "").strip()
-            port_raw = os.getenv("PORT", "").strip()
-            if wp_raw.isdigit():
-                preferred = int(wp_raw)
-            elif port_raw.isdigit():
-                preferred = int(port_raw)
-            else:
-                preferred = 8080
-            wh_port = _pick_free_tcp_port(preferred=preferred)
-            if wh_port != preferred:
-                _log.warning(
-                    "Порт %s занят — для ЮKassa выбран свободный %s. "
-                    "Обновите проброс портов в Docker / upstream nginx, если трафик шёл на %s.",
-                    preferred,
-                    wh_port,
-                    preferred,
-                )
+            wh_port = _effective_webhook_port(default=8080)
             _log.info(
                 "Webhook HTTP: http://%s:%s (ЮKassa: /yookassa-webhook, Yclients: /yclients-webhook)",
                 wh_host,
