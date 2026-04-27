@@ -1068,7 +1068,10 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
     act = await db.get_user_activity_message(uid)
     if act:
         await _render_user_activity_message(callback.bot, db, config, uid)
-        await callback.answer()
+        try:
+            await callback.answer()
+        except Exception:
+            pass
         return
 
     target_mid = int(root_id) if root_id else int(callback.message.message_id)
@@ -1079,7 +1082,10 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
         config=config,
         db=db,
     )
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "menu:prices")
