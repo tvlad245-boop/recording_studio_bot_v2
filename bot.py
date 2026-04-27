@@ -20,6 +20,10 @@ from services.webhook_context import set_payment_webhook_context
 from yookassa_webhook import app as yookassa_webhook_app
 from services.yclients_studio import yclients_studio_enabled
 
+# ASGI app (для платформ, которые сами запускают uvicorn по `PORT` и ищут переменную `app`)
+# В этом режиме сам bot.py должен быть entrypoint для polling, а HTTP обслуживается внешним uvicorn.
+app = yookassa_webhook_app
+
 
 def _pick_free_tcp_port(*, preferred: int, span: int = 48) -> int:
     """
@@ -171,11 +175,18 @@ async def main() -> None:
         # - ЮKassa (если настроена)
         # - Yclients (если включён режим студии из CRM или задан token)
         yclients_token = (os.getenv("YCLIENTS_WEBHOOK_TOKEN", "").strip() or os.getenv("YCLIENTS_WEBHOOK_SECRET", "").strip())
+        disable_internal_http = (os.getenv("DISABLE_INTERNAL_HTTP", "0") or "0").strip() in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "YES",
+        )
         need_http_webhook = bool(cfg.yookassa_shop_id and cfg.yookassa_secret_key) or bool(
             yclients_studio_enabled(cfg) or yclients_token
         )
 
-        if need_http_webhook:
+        if need_http_webhook and not disable_internal_http:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
             wh_port = _effective_webhook_port(default=8080)
             _log.info(
