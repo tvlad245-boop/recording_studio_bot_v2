@@ -136,6 +136,12 @@ class Database:
                     processed_at TEXT NOT NULL
                 );
 
+                -- Yclients: идемпотентность webhook (event_id/хэш тела)
+                CREATE TABLE IF NOT EXISTS yclients_processed_events (
+                    event_id TEXT PRIMARY KEY,
+                    processed_at TEXT NOT NULL
+                );
+
                 -- Исключения от правила «пн–пт со звукорежиссёром, сб–вс без»: on = работает в выходной, off = выходной в будний
                 CREATE TABLE IF NOT EXISTS engineer_day_exceptions (
                     day TEXT PRIMARY KEY,
@@ -151,6 +157,18 @@ class Database:
             await self._migrate_bookings_client_cleanup()
             await self._migrate_bookings_pending_meta()
             await self._migrate_user_activity_notice()
+            await self._migrate_bookings_yclients_record_id()
+
+    async def _migrate_bookings_yclients_record_id(self) -> None:
+        async with self.connect() as db:
+            self._configure(db)
+            try:
+                await db.execute(
+                    "ALTER TABLE bookings ADD COLUMN yclients_record_id INTEGER"
+                )
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
 
     async def _migrate_user_activity_notice(self) -> None:
         async with self.connect() as db:
@@ -322,6 +340,71 @@ class Database:
                 return True
             except aiosqlite.IntegrityError:
                 return False
+
+    # --- Yclients (вебхук: идемпотентность + поиск по record_id) ---
+
+    async def mark_yclients_event_processed(self, event_id: str) -> bool:
+        """
+        Атомарно помечает event_id как обработанный.
+        True — первая обработка, False — дубликат.
+        """
+        eid = (event_id or "").strip()
+        if not eid:
+            return False
+        async with self.connect() as db:
+            self._configure(db)
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            try:
+                await db.execute(
+                    "INSERT INTO yclients_processed_events(event_id, processed_at) VALUES (?, ?)",
+                    (eid, now),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
+
+    async def get_booking_by_yclients_record_id(self, record_id: int) -> dict[str, Any] | None:
+        rid = int(record_id)
+        if rid <= 0:
+            return None
+        async with self.connect() as db:
+            self._configure(db)
+            cur = await db.execute(
+                "SELECT * FROM bookings WHERE yclients_record_id = ? ORDER BY id DESC LIMIT 1",
+                (rid,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def update_booking_times_by_yclients_record_id(
+        self, record_id: int, *, day: str, start_time: str, end_time: str
+    ) -> dict[str, Any] | None:
+        rid = int(record_id)
+        if rid <= 0:
+            return None
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT * FROM bookings WHERE yclients_record_id = ? LIMIT 1",
+                (rid,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
+            await db.execute(
+                "UPDATE bookings SET day = ?, start_time = ?, end_time = ? WHERE yclients_record_id = ?",
+                (str(day), str(start_time), str(end_time), rid),
+            )
+            await db.commit()
+            cur2 = await db.execute(
+                "SELECT * FROM bookings WHERE yclients_record_id = ? ORDER BY id DESC LIMIT 1",
+                (rid,),
+            )
+            r2 = await cur2.fetchone()
+            return dict(r2) if r2 else None
 
     async def get_user_activity_message(self, user_id: int) -> dict[str, Any] | None:
         """Одно «липкое» сообщение пользователя: накопление успешных заявок."""
@@ -1054,6 +1137,83 @@ class Database:
 
             await db.commit()
             return int(booking_cur.lastrowid)
+
+    async def create_booking_studio_yclients(
+        self,
+        *,
+        user_id: int,
+        user_name: str,
+        phone: str,
+        tg_username: str | None,
+        requires_engineer: bool,
+        day: str,
+        start_time: str,
+        end_time: str,
+        booked_slot_ids_csv: str,
+        services: str,
+        total_price: int,
+        status: str = "active",
+        yclients_record_id: int | None = None,
+    ) -> int | None:
+        """
+        Бронь на студию без слотов SQLite (расписание в Yclients).
+        """
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT 1 FROM bookings
+                WHERE user_id = ? AND status IN (
+                    'active', 'pending_payment', 'awaiting_yookassa', 'pending_cancel', 'pending_reschedule'
+                )
+                  AND (booking_kind IS NULL OR booking_kind = 'studio')
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                return None
+            booking_cur = await db.execute(
+                """
+                INSERT INTO bookings(
+                    user_id, user_name, phone, day, start_time, end_time, services, total_price, status, created_at,
+                    booked_slot_ids, booking_kind, notes, tg_username, requires_engineer, yclients_record_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'studio', NULL, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    user_name,
+                    phone,
+                    day,
+                    start_time,
+                    end_time,
+                    services,
+                    total_price,
+                    status,
+                    datetime.utcnow().isoformat(),
+                    booked_slot_ids_csv,
+                    tg_username,
+                    1 if requires_engineer else 0,
+                    yclients_record_id,
+                ),
+            )
+            await db.commit()
+            return int(booking_cur.lastrowid)
+
+    async def set_booking_yclients_record_id(
+        self, booking_id: int, record_id: int | None
+    ) -> None:
+        """Связь локальной брони с записью в Yclients (после успешного POST /records)."""
+        async with self.connect() as db:
+            self._configure(db)
+            await db.execute(
+                "UPDATE bookings SET yclients_record_id = ? WHERE id = ?",
+                (record_id, booking_id),
+            )
+            await db.commit()
 
     async def create_service_order(
         self,

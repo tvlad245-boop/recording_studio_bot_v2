@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import socket
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -17,7 +18,49 @@ from services.pricing_middleware import register_pricing_middleware
 from services.reminders import ReminderService
 from services.webhook_context import set_payment_webhook_context
 from yookassa_webhook import app as yookassa_webhook_app
+from services.yclients_studio import yclients_studio_enabled
 
+# ASGI app (для платформ, которые сами запускают uvicorn по `PORT` и ищут переменную `app`)
+# В этом режиме сам bot.py должен быть entrypoint для polling, а HTTP обслуживается внешним uvicorn.
+app = yookassa_webhook_app
+
+
+def _pick_free_tcp_port(*, preferred: int, span: int = 48) -> int:
+    """
+    Первый свободный порт начиная с preferred (0.0.0.0), чтобы не падать с Errno 98,
+    если 8080 уже занят другим процессом в контейнере.
+    """
+    last = preferred + max(span, 1)
+    for port in range(preferred, last):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    raise RuntimeError(
+        f"Не найден свободный TCP-порт в диапазоне {preferred}..{last - 1} для ЮKassa webhook"
+    )
+
+def _effective_webhook_port(*, default: int = 8080) -> int:
+    """
+    В PaaS (в т.ч. bothost) наружный прокси часто ждёт, что процесс слушает РОВНО port из env PORT.
+    Поэтому:
+    - если задан WEBHOOK_PORT — это явное желание слушать его (и можно автоподобрать следующий свободный);
+    - иначе, если задан PORT — слушаем его строго, без сканирования;
+    - иначе — дефолт 8080 + автоподбор свободного.
+    """
+    wp_raw = os.getenv("WEBHOOK_PORT", "").strip()
+    port_raw = os.getenv("PORT", "").strip()
+    if wp_raw.isdigit():
+        preferred = int(wp_raw)
+        return _pick_free_tcp_port(preferred=preferred)
+    if port_raw.isdigit():
+        return int(port_raw)
+    return _pick_free_tcp_port(preferred=default)
 
 async def _run_yookassa_uvicorn(host: str, port: int) -> None:
     import uvicorn
@@ -33,6 +76,35 @@ async def _run_yookassa_uvicorn(host: str, port: int) -> None:
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+async def _yookassa_webhook_background(host: str, port: int, log: logging.Logger) -> None:
+    """
+    Uvicorn при ошибке bind часто вызывает sys.exit(1) — это SystemExit.
+    В asyncio.gather() это роняет весь процесс и polling не стартует.
+    Здесь глотаем SystemExit/OSError: бот остаётся в polling, webhook просто не работает.
+    """
+    try:
+        await _run_yookassa_uvicorn(host, port)
+    except asyncio.CancelledError:
+        raise
+    except SystemExit as e:
+        exc_code = e.args[0] if e.args else "?"
+        log.error(
+            "ЮKassa webhook (uvicorn) завершился с SystemExit(%s) на порту %s — "
+            "часто это «address already in use». Задайте свободный WEBHOOK_PORT или освободите порт. "
+            "Бот продолжает работу в polling; автоподтверждение оплат по webhook недоступно.",
+            exc_code,
+            port,
+        )
+    except OSError as e:
+        log.error(
+            "ЮKassa webhook: порт %s — %s. Бот в polling работает; webhook отключён.",
+            port,
+            e,
+        )
+    except Exception:
+        log.exception("ЮKassa webhook: неожиданная ошибка; бот в polling продолжает работу.")
 
 
 async def main() -> None:
@@ -99,14 +171,41 @@ async def main() -> None:
         async def _polling() -> None:
             await dp.start_polling(bot, config=cfg, db=db, reminder_service=reminder_service)
 
-        if cfg.yookassa_shop_id and cfg.yookassa_secret_key:
+        # HTTP вебхуки в этом же процессе:
+        # - ЮKassa (если настроена)
+        # - Yclients (если включён режим студии из CRM или задан token)
+        yclients_token = (os.getenv("YCLIENTS_WEBHOOK_TOKEN", "").strip() or os.getenv("YCLIENTS_WEBHOOK_SECRET", "").strip())
+        disable_internal_http = (os.getenv("DISABLE_INTERNAL_HTTP", "0") or "0").strip() in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "YES",
+        )
+        need_http_webhook = bool(cfg.yookassa_shop_id and cfg.yookassa_secret_key) or bool(
+            yclients_studio_enabled(cfg) or yclients_token
+        )
+
+        if need_http_webhook and not disable_internal_http:
             wh_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
-            # Bothost/PAAS часто задаёт порт через переменную PORT.
-            wh_port = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")))
-            await asyncio.gather(
-                _polling(),
-                _run_yookassa_uvicorn(wh_host, wh_port),
+            wh_port = _effective_webhook_port(default=8080)
+            _log.info(
+                "Webhook HTTP: http://%s:%s (ЮKassa: /yookassa-webhook, Yclients: /yclients-webhook)",
+                wh_host,
+                wh_port,
             )
+            yk_task = asyncio.create_task(
+                _yookassa_webhook_background(wh_host, wh_port, _log),
+                name="yookassa-uvicorn",
+            )
+            try:
+                await _polling()
+            finally:
+                yk_task.cancel()
+                try:
+                    await yk_task
+                except asyncio.CancelledError:
+                    pass
         else:
             await _polling()
     finally:
