@@ -119,6 +119,11 @@ def seances_to_ui_slots(seances: list[dict[str, Any]], cfg: Config | None = None
 async def fetch_seances_for_day(cfg: Config, day_yyyy_mm_dd: str) -> list[dict[str, Any]]:
     staff = int(cfg.yclients_default_staff_id)
     svc = service_ids_for_book(cfg)
+    # Важно: book_times принимает service_ids[] как «набор услуг в одной записи».
+    # Если передать несколько id, Yclients может посчитать длительность как сумму, и слоты в боте
+    # станут вида 10:00–12:30. Для витрины слотов берём только одну базовую услугу (первую).
+    if svc:
+        svc = [int(svc[0])]
     return await yclients_book_times(
         cfg,
         staff_id=staff,
