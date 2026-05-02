@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from calendar import monthrange
 from datetime import date as dt_date
@@ -68,6 +69,8 @@ from keyboards import (
     reschedule_confirm_kb,
     slots_pick_kb,
     slots_rs_pick_kb,
+    yclients_hours_kb,
+    yclients_start_kb,
     studio_mode_kb,
     subscription_kb,
     tariff_category_kb,
@@ -85,11 +88,23 @@ from services.yookassa_payments import (
     payment_destination_block_html,
     pop_yookassa_payments_for_booking,
 )
+from services import yclients_studio as yc
+from services.yclients_client import YclientsError
 from states import BookingStates
 
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+async def _studio_day_slots(
+    data: dict[str, Any], config: Config, db: Database, day: str
+) -> list[dict[str, Any]]:
+    if data.get("yclients_studio"):
+        alt = yc.slot_rows_for_day(data, config, day)
+        if alt is not None:
+            return alt
+    return await db.get_all_slots_for_day(day)
 
 def _truncate_html(text: str, limit: int) -> str:
     """Обрезка HTML-текста под лимит Telegram для обычных сообщений / подписей."""
@@ -638,6 +653,24 @@ def _slots_caption(day: str, n_selected: int) -> str:
     )
 
 
+def _yc_start_caption(day: str) -> str:
+    return (
+        f"<b>📌 Дата:</b> {day}\n\n"
+        "<b>Шаг 1.</b> Выберите <b>время начала</b> (сетка по услуге <b>1 ч</b> в Yclients).\n"
+        "Дальше вы выберете длительность <b>1–4 ч</b> — каждый вариант отдельная услуга в CRM, "
+        "<b>сумма из прайса Yclients</b>.\n\n"
+        "<i>Слева — с полуночи до 11:59, справа — с полудня.</i>"
+    )
+
+
+def _yc_hours_caption(day: str, start_slot_label: str) -> str:
+    return (
+        f"<b>📌 Дата:</b> {day}\n"
+        f"<b>Старт:</b> {start_slot_label}\n\n"
+        "<b>Шаг 2.</b> Сколько часов бронируем?"
+    )
+
+
 def _prices_text(cfg: Config, pricing: EffectivePricing) -> str:
     """Прайс с учётом включённых/выключенных услуг в админке."""
     parts: list[str] = ["<b>💳 Прайс студии</b>"]
@@ -1055,7 +1088,10 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
     act = await db.get_user_activity_message(uid)
     if act:
         await _render_user_activity_message(callback.bot, db, config, uid)
-        await callback.answer()
+        try:
+            await callback.answer()
+        except Exception:
+            pass
         return
 
     target_mid = int(root_id) if root_id else int(callback.message.message_id)
@@ -1066,7 +1102,10 @@ async def menu_home(callback: CallbackQuery, state: FSMContext, config: Config, 
         config=config,
         db=db,
     )
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "menu:prices")
@@ -1333,7 +1372,7 @@ async def sub_check(
         if prod in ("no_engineer", "with_engineer"):
             await show_studio_mode(callback, state, config, db)
         else:
-            await show_calendar(callback, state, db)
+            await show_calendar(callback, state, db, config)
         return
     await callback.answer("Подписка не найдена", show_alert=True)
 
@@ -1359,18 +1398,48 @@ async def show_studio_mode(
     )
 
 
-async def show_calendar(callback: CallbackQuery, state: FSMContext, db: Database, year: int | None = None, month: int | None = None) -> None:
-    available_days = set(await db.get_available_days())
+async def show_calendar(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    config: Config,
+    year: int | None = None,
+    month: int | None = None,
+) -> None:
     if year is None or month is None:
         year, month = now_month()
-    await state.set_state(BookingStates.choosing_date)
-    await state.update_data(cal_year=year, cal_month=month, booking_mode="hourly")
-
     data = await state.get_data()
+    use_yc = yc.yclients_studio_enabled(config) and (data.get("product") in ("no_engineer", "with_engineer"))
+    if use_yc:
+        try:
+            yc_days = set(await yc.available_days_in_window(config))
+        except YclientsError as e:
+            logger.warning("Yclients show_calendar: %s", e)
+            await callback.answer(
+                "Не удалось загрузить расписание Yclients. Попробуйте позже или отключите YCLIENTS_STUDIO.",
+                show_alert=True,
+            )
+            return
+        available_days = yc_days
+    else:
+        available_days = set(await db.get_available_days())
+    await state.set_state(BookingStates.choosing_date)
+    await state.update_data(
+        cal_year=year,
+        cal_month=month,
+        booking_mode="hourly",
+        yclients_studio=False,
+        yclients_seances=[],
+        yclients_hour_pack=None,
+        yclients_start_idx=None,
+    )
+
     closed_admin = await db.get_closed_days_in_month(year, month)
     blocked: set[str] = set(closed_admin)
-    if data.get("product") == "with_engineer":
+    if not use_yc and data.get("product") == "with_engineer":
         available_days = await db.filter_days_for_engineer_booking(available_days)
+        blocked |= await db.get_engineer_unavailable_days_in_month(year, month)
+    if use_yc and data.get("product") == "with_engineer":
         blocked |= await db.get_engineer_unavailable_days_in_month(year, month)
     await _edit(
         callback.message,
@@ -1444,21 +1513,25 @@ async def show_tariff_calendar(
 
 
 @router.callback_query(F.data == "book:calendar")
-async def back_to_calendar(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def back_to_calendar(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
     data = await state.get_data()
-    await show_calendar(callback, state, db, year=data.get("cal_year"), month=data.get("cal_month"))
+    await show_calendar(
+        callback, state, db, config, year=data.get("cal_year"), month=data.get("cal_month")
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cal:"))
-async def calendar_nav(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def calendar_nav(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
     payload = callback.data.split(":", maxsplit=1)[1]
     if payload == "today":
         y, m = now_month()
     else:
         y_str, m_str = payload.split("-")
         y, m = int(y_str), int(m_str)
-    await show_calendar(callback, state, db, year=y, month=m)
+    await show_calendar(callback, state, db, config, year=y, month=m)
     await callback.answer()
 
 
@@ -1470,9 +1543,11 @@ async def back_to_pick_product(callback: CallbackQuery, state: FSMContext, prici
 
 
 @router.callback_query(F.data == "stm:hourly", BookingStates.choosing_studio_mode)
-async def studio_mode_hourly(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def studio_mode_hourly(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
     await state.update_data(booking_mode="hourly", tariff_label=None)
-    await show_calendar(callback, state, db)
+    await show_calendar(callback, state, db, config)
     await callback.answer()
 
 
@@ -1812,15 +1887,17 @@ async def _send_studio_pay_contact_screen(
     total: int,
     product: str,
     tariff_label: str | None,
+    hours_display: str | None = None,
 ) -> None:
     await state.update_data(pay_online=False)
     svc_line = html_escape(str(tariff_label or pricing.service_title(product)))
+    h_str = (hours_display or "").strip() or str(hours)
     base_core = "\n".join(
         [
             f"<b>Услуга:</b> {svc_line}",
             f"<b>Дата:</b> {day}",
             f"<b>Время:</b> {slot_text}",
-            f"<b>Часов:</b> {hours}",
+            f"<b>Длит./часов (тариф):</b> {h_str}",
             f"<b>Итого:</b> {total} руб",
         ]
     )
@@ -1938,17 +2015,61 @@ async def pick_tariff_date(
 
 
 @router.callback_query(F.data.startswith("date:"), BookingStates.choosing_date)
-async def pick_date(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def pick_date(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
     picked_day = callback.data.split(":", maxsplit=1)[1]
-    slots = await db.get_all_slots_for_day(picked_day)
+    data = await state.get_data()
+    use_yc = yc.yclients_studio_enabled(config) and (data.get("product") in ("no_engineer", "with_engineer"))
+    yc_pack = use_yc and yc.hour_pack_configured(config)
+    if use_yc:
+        try:
+            seances, slots = await yc.load_day_seances_and_slots(config, picked_day)
+        except YclientsError as e:
+            logger.warning("Yclients pick_date: %s", e)
+            await callback.answer(
+                "Не удалось загрузить слоты Yclients. Попробуйте другую дату.",
+                show_alert=True,
+            )
+            return
+        yc_flag = True
+    else:
+        slots = await db.get_all_slots_for_day(picked_day)
+        seances = []
+        yc_flag = False
     if not slots:
         await callback.answer("На эту дату нет расписания слотов.", show_alert=True)
         return
     if not any(Database.slot_row_is_active(s["is_active"]) for s in slots):
         await callback.answer("На эту дату нет свободных слотов", show_alert=True)
         return
+    if yc_pack:
+        await state.set_state(BookingStates.choosing_yc_start)
+        await state.update_data(
+            day=picked_day,
+            selected_slot_ids=[],
+            yclients_studio=True,
+            yclients_seances=seances,
+            yclients_hour_pack=None,
+            yclients_start_idx=None,
+            slot_ids=[],
+        )
+        await _edit(
+            callback.message,
+            _yc_start_caption(picked_day),
+            reply_markup=yclients_start_kb(slots),
+        )
+        await callback.answer()
+        return
     await state.set_state(BookingStates.choosing_slot)
-    await state.update_data(day=picked_day, selected_slot_ids=[])
+    await state.update_data(
+        day=picked_day,
+        selected_slot_ids=[],
+        yclients_studio=yc_flag,
+        yclients_seances=seances if yc_flag else [],
+        yclients_hour_pack=None,
+        yclients_start_idx=None,
+    )
     await _edit(
         callback.message,
         _slots_caption(picked_day, 0),
@@ -1957,15 +2078,161 @@ async def pick_date(callback: CallbackQuery, state: FSMContext, db: Database) ->
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("yc_st:"), BookingStates.choosing_yc_start)
+async def yc_pick_start(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    try:
+        idx = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    day = data.get("day")
+    seances = data.get("yclients_seances") or []
+    if not day or not isinstance(seances, list) or idx < 0 or idx >= len(seances):
+        await callback.answer("Сессия устарела. Откройте календарь снова.", show_alert=True)
+        return
+    slots_ui = yc.seances_to_ui_slots(seances, config)
+    if idx >= len(slots_ui):
+        await callback.answer("Сессия устарела. Откройте календарь снова.", show_alert=True)
+        return
+    row = slots_ui[idx]
+    start_lbl = f"{row['start_time']} — {row['end_time']}"
+    await state.set_state(BookingStates.choosing_yc_hours)
+    await state.update_data(yclients_start_idx=idx)
+    await _edit(
+        callback.message,
+        _yc_hours_caption(str(day), html_escape(start_lbl)),
+        reply_markup=yclients_hours_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "yc_back:start", BookingStates.choosing_yc_hours)
+async def yc_back_to_start(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    data = await state.get_data()
+    day = data.get("day")
+    seances = data.get("yclients_seances") or []
+    if not day or not isinstance(seances, list) or not seances:
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    slots_ui = yc.seances_to_ui_slots(seances, config)
+    await state.set_state(BookingStates.choosing_yc_start)
+    await _edit(
+        callback.message,
+        _yc_start_caption(str(day)),
+        reply_markup=yclients_start_kb(slots_ui),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("yc_h:"), BookingStates.choosing_yc_hours)
+async def yc_pick_hours(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    config: Config,
+    pricing: EffectivePricing,
+) -> None:
+    try:
+        hours = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    if hours not in (1, 2, 3, 4):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    day = str(data.get("day") or "")
+    seances = data.get("yclients_seances") or []
+    idx_raw = data.get("yclients_start_idx")
+    try:
+        idx = int(idx_raw) if idx_raw is not None else -1
+    except (TypeError, ValueError):
+        idx = -1
+    product = data.get("product")
+    if product not in ("no_engineer", "with_engineer") or not day or not isinstance(seances, list):
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    if idx < 0 or idx >= len(seances):
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    try:
+        matched = await yc.match_duration_seance(
+            config,
+            day_yyyy_mm_dd=day,
+            start_ref=seances[idx],
+            hours=hours,
+        )
+    except YclientsError as e:
+        logger.warning("Yclients yc_pick_hours: %s", e)
+        await callback.answer("Не удалось проверить слот в Yclients. Попробуйте снова.", show_alert=True)
+        return
+    if not matched:
+        await callback.answer(
+            "На это время нет свободной записи выбранной длительности. Выберите другое время или часы.",
+            show_alert=True,
+        )
+        return
+    try:
+        prices = await yc.service_prices_map_rub(config)
+    except YclientsError as e:
+        logger.warning("Yclients prices: %s", e)
+        await callback.answer("Не удалось загрузить цены из Yclients.", show_alert=True)
+        return
+    sid = yc.service_id_for_hours_pack(config, hours)
+    total = int(prices.get(sid, 0))
+    if total <= 0:
+        await callback.answer(
+            "Для этой услуги в Yclients не найдена цена (price_min / price_max в онлайн-записи).",
+            show_alert=True,
+        )
+        return
+    ui_one = yc.seances_to_ui_slots([matched], config)
+    slot_text = f"{ui_one[0]['start_time']} — {ui_one[0]['end_time']}"
+    await state.update_data(
+        yclients_hour_pack={"start_idx": idx, "hours": hours, "service_id": sid},
+        slot_ids=[],
+        slot_text=slot_text,
+        total=total,
+        tariff_label=None,
+        booking_mode="hourly",
+        slot_hours_caption=str(hours),
+        selected_slot_ids=[],
+    )
+    await callback.answer()
+    chat_id = callback.message.chat.id
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await _send_studio_pay_contact_screen(
+        callback.bot,
+        chat_id=chat_id,
+        state=state,
+        config=config,
+        db=db,
+        pricing=pricing,
+        day=day,
+        slot_text=slot_text,
+        hours=hours,
+        total=total,
+        product=str(product),
+        tariff_label=None,
+        hours_display=str(hours),
+    )
+
+
 @router.callback_query(F.data.startswith("slot_pick:"), BookingStates.choosing_slot)
-async def slot_toggle(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def slot_toggle(
+    callback: CallbackQuery, state: FSMContext, db: Database, config: Config
+) -> None:
     sid = int(callback.data.split(":", maxsplit=1)[1])
     data = await state.get_data()
     day = data.get("day")
     if not day:
         await callback.answer("Сессия устарела", show_alert=True)
         return
-    slots = await db.get_all_slots_for_day(day)
+    slots = await _studio_day_slots(data, config, db, day)
     by_id = {int(s["id"]): s for s in slots}
     if sid not in by_id or not Database.slot_row_is_active(by_id[sid]["is_active"]):
         await callback.answer("Этот час занят", show_alert=True)
@@ -2004,7 +2271,7 @@ async def slot_confirm(
     if not day:
         await callback.answer("Сессия устарела", show_alert=True)
         return
-    slots = await db.get_all_slots_for_day(day)
+    slots = await _studio_day_slots(data, config, db, day)
     try:
         id_set = {int(x) for x in raw}
     except (TypeError, ValueError):
@@ -2017,7 +2284,7 @@ async def slot_confirm(
         return
     if any(not Database.slot_row_is_active(s["is_active"]) for s in chosen):
         await callback.answer("Часть выбранных часов уже занята. Обновите экран.", show_alert=True)
-        fresh = await db.get_all_slots_for_day(day)
+        fresh = await _studio_day_slots(data, config, db, day)
         await state.update_data(selected_slot_ids=[])
         await _edit(
             callback.message,
@@ -2037,16 +2304,33 @@ async def slot_confirm(
         key=lambda s: Database.time_sort_key(Database._coerce_cell_str(s["start_time"])),
     )
     ids_ordered = [int(s["id"]) for s in chosen_sorted]
-    hours = len(chosen_sorted)
     hourly_price = pricing.service_price(product)
-    total = hours * hourly_price
-    slot_text = f"{chosen_sorted[0]['start_time']} — {chosen_sorted[-1]['end_time']}"
+    h_disp: str | None = None
+    if data.get("yclients_studio") and all(int(x) < 0 for x in ids_ordered):
+        seances = data.get("yclients_seances") or []
+        if not isinstance(seances, list) or not seances:
+            await callback.answer("Сессия устарела, откройте календарь снова", show_alert=True)
+            return
+        total, _sec, slot_text, hlab, hfrac = yc.compute_billing(
+            seances, ids_ordered, hourly_price, config
+        )
+        if total <= 0 or not slot_text:
+            await callback.answer("Некорректные слоты, выберите снова.", show_alert=True)
+            return
+        hours = max(1, int(math.ceil(hfrac)))
+        h_disp = hlab or None
+    else:
+        hours = len(chosen_sorted)
+        total = hours * hourly_price
+        slot_text = f"{chosen_sorted[0]['start_time']} — {chosen_sorted[-1]['end_time']}"
+
     await state.update_data(
         slot_ids=ids_ordered,
         slot_text=slot_text,
         total=total,
         tariff_label=None,
         booking_mode="hourly",
+        slot_hours_caption=(h_disp or "") if h_disp else "",
     )
 
     await callback.answer()
@@ -2069,6 +2353,7 @@ async def slot_confirm(
         total=total,
         product=str(product),
         tariff_label=None,
+        hours_display=h_disp,
     )
 
 @router.callback_query(F.data.startswith("paymeth:"), BookingStates.choosing_pay_method)
@@ -2151,7 +2436,14 @@ async def pay_method_chosen(
     slot_text = data.get("slot_text")
     total = data.get("total")
     slot_ids = data.get("slot_ids") or []
-    hours = len(slot_ids)
+    hp = data.get("yclients_hour_pack")
+    if isinstance(hp, dict) and int(hp.get("hours") or 0) > 0:
+        hours = int(hp["hours"])
+    else:
+        hours = len(slot_ids)
+    yc_st = bool(data.get("yclients_studio"))
+    shc = (data.get("slot_hours_caption") or "").strip()
+    h_line = shc or str(hours)
     tariff_label = data.get("tariff_label")
     svc_line = html_escape(str(tariff_label or pricing.service_title(product)))
     base_core = "\n".join(
@@ -2159,39 +2451,73 @@ async def pay_method_chosen(
             f"<b>Услуга:</b> {svc_line}",
             f"<b>Дата:</b> {day}",
             f"<b>Время:</b> {slot_text}",
-            f"<b>Часов:</b> {hours}",
+            f"<b>Длит./часов (тариф):</b> {h_line}",
             f"<b>Итого:</b> {total} руб",
         ]
     )
     await state.set_state(BookingStates.entering_contacts)
     if pay_online:
-        screen = (
-            "<b>💳 Онлайн-оплата (ЮKassa)</b>\n\n"
-            f"{base_core}\n\n"
-            "Отправьте <b>одним сообщением (2 строки)</b>:\n"
-            "• имя\n"
-            "• ваш @username в Telegram (или «—»)\n\n"
-            "<i>Пример:\n"
-            "Иван\n"
-            "@nickname</i>"
-        )
+        if yc_st:
+            screen = (
+                "<b>💳 Онлайн-оплата (ЮKassa)</b>\n\n"
+                f"{base_core}\n\n"
+                "Для CRM Yclients укажите <b>телефон</b>.\n\n"
+                "Отправьте <b>одним сообщением (3 строки)</b>:\n"
+                "• имя\n"
+                "• телефон (например +79001234567)\n"
+                "• ваш @username в Telegram (или «—»)\n\n"
+                "<i>Пример:\n"
+                "Иван\n"
+                "+79001234567\n"
+                "@nickname</i>"
+            )
+        else:
+            screen = (
+                "<b>💳 Онлайн-оплата (ЮKassa)</b>\n\n"
+                f"{base_core}\n\n"
+                "Отправьте <b>одним сообщением (2 строки)</b>:\n"
+                "• имя\n"
+                "• ваш @username в Telegram (или «—»)\n\n"
+                "<i>Пример:\n"
+                "Иван\n"
+                "@nickname</i>"
+            )
     else:
         dest = payment_destination_block_html(config, bank_transfer=True, settings=s)
-        screen = (
-            "<b>💳 Реквизиты для оплаты</b>\n\n"
-            f"{base_core}\n\n"
-            f"{dest}\n\n"
-            "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
-            "• имя\n"
-            "• фамилия\n"
-            "• банк (с какого будет оплата)\n"
-            "• ваш @username в Telegram (или «—»)\n\n"
-            "<i>Пример:\n"
-            "Иван\n"
-            "Иванов\n"
-            "Сбербанк\n"
-            "@nickname</i>"
-        )
+        if yc_st:
+            screen = (
+                "<b>💳 Реквизиты для оплаты</b>\n\n"
+                f"{base_core}\n\n"
+                f"{dest}\n\n"
+                "<b>Далее отправьте одним сообщением (5 строк):</b>\n"
+                "• имя\n"
+                "• фамилия\n"
+                "• телефон (для записи в Yclients)\n"
+                "• банк (с какого будет оплата)\n"
+                "• ваш @username в Telegram (или «—»)\n\n"
+                "<i>Пример:\n"
+                "Иван\n"
+                "Иванов\n"
+                "+79001234567\n"
+                "Сбербанк\n"
+                "@nickname</i>"
+            )
+        else:
+            screen = (
+                "<b>💳 Реквизиты для оплаты</b>\n\n"
+                f"{base_core}\n\n"
+                f"{dest}\n\n"
+                "<b>Далее отправьте одним сообщением (4 строки):</b>\n"
+                "• имя\n"
+                "• фамилия\n"
+                "• банк (с какого будет оплата)\n"
+                "• ваш @username в Telegram (или «—»)\n\n"
+                "<i>Пример:\n"
+                "Иван\n"
+                "Иванов\n"
+                "Сбербанк\n"
+                "@nickname</i>"
+            )
     try:
         await _edit_payment_screen_message(
             callback.bot,
@@ -2361,59 +2687,137 @@ async def enter_contacts(
     raw = (message.text or "").strip()
     data = await state.get_data()
     pay_online = bool(data.get("pay_online"))
+    product = data.get("product")
+    yc_st = bool(data.get("yclients_studio")) and product in ("no_engineer", "with_engineer")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    yc_phone: str = ""
     if pay_online:
-        if len(lines) < 2:
-            warn = await message.answer(
-                "Нужно 2 строки:\n"
-                "• имя\n"
-                "• @username в Telegram (или «—»)\n\n"
-                "Пример:\n"
-                "Иван\n"
-                "@nickname"
-            )
-            c = list(data.get("cleanup_ids", []))
-            c.extend([message.message_id, warn.message_id])
-            await state.update_data(cleanup_ids=c)
-            return
-        first_name, tg_line = lines[0], lines[1]
-        user_name = first_name.strip()
-        bank = "—"
-        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
-        if len(first_name) < 1:
-            warn = await message.answer("Укажите имя (непустая первая строка).")
-            c = list(data.get("cleanup_ids", []))
-            c.extend([message.message_id, warn.message_id])
-            await state.update_data(cleanup_ids=c)
-            return
+        if yc_st:
+            if len(lines) < 3:
+                warn = await message.answer(
+                    "Нужно 3 строки:\n"
+                    "• имя\n"
+                    "• телефон (например +79001234567)\n"
+                    "• @username в Telegram (или «—»)\n\n"
+                    "Пример:\n"
+                    "Иван\n"
+                    "+79001234567\n"
+                    "@nickname"
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            first_name, phone_line, tg_line = lines[0], lines[1], lines[2]
+            user_name = first_name.strip()
+            yc_phone = yc.normalize_ru_phone(phone_line)
+            tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+            if len(first_name) < 1 or len(yc_phone) < 10:
+                warn = await message.answer(
+                    "Укажите непустое имя и корректный телефон (как в примере +79001234567)."
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            bank = yc_phone
+        else:
+            if len(lines) < 2:
+                warn = await message.answer(
+                    "Нужно 2 строки:\n"
+                    "• имя\n"
+                    "• @username в Telegram (или «—»)\n\n"
+                    "Пример:\n"
+                    "Иван\n"
+                    "@nickname"
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            first_name, tg_line = lines[0], lines[1]
+            user_name = first_name.strip()
+            bank = "—"
+            tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+            if len(first_name) < 1:
+                warn = await message.answer("Укажите имя (непустая первая строка).")
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
     else:
-        if len(lines) < 4:
-            warn = await message.answer(
-                "Нужно ровно 4 строки:\n"
-                "• имя\n"
-                "• фамилия\n"
-                "• банк (с какого будет оплата)\n"
-                "• @username в Telegram (или «—»)\n\n"
-                "Пример:\n"
-                "Иван\n"
-                "Иванов\n"
-                "Сбербанк\n"
-                "@nickname"
+        if yc_st:
+            if len(lines) < 5:
+                warn = await message.answer(
+                    "Нужно 5 строк:\n"
+                    "• имя\n"
+                    "• фамилия\n"
+                    "• телефон\n"
+                    "• банк (с какого будет оплата)\n"
+                    "• @username в Telegram (или «—»)\n\n"
+                    "Пример:\n"
+                    "Иван\n"
+                    "Иванов\n"
+                    "+79001234567\n"
+                    "Сбербанк\n"
+                    "@nickname"
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            first_name, last_name, phone_line, bank, tg_line = (
+                lines[0],
+                lines[1],
+                lines[2],
+                lines[3],
+                lines[4],
             )
-            c = list(data.get("cleanup_ids", []))
-            c.extend([message.message_id, warn.message_id])
-            await state.update_data(cleanup_ids=c)
-            return
-        first_name, last_name, bank, tg_line = lines[0], lines[1], lines[2], lines[3]
-        user_name = f"{first_name} {last_name}".strip()
-        tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
-        if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
-            warn = await message.answer("Проверьте имя, фамилию и название банка (минимум 2 символа).")
-            c = list(data.get("cleanup_ids", []))
-            c.extend([message.message_id, warn.message_id])
-            await state.update_data(cleanup_ids=c)
-            return
-    await state.update_data(name=user_name, phone=bank, tg_username=tg_u)
+            user_name = f"{first_name} {last_name}".strip()
+            yc_phone = yc.normalize_ru_phone(phone_line)
+            tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+            if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2 or len(yc_phone) < 10:
+                warn = await message.answer(
+                    "Проверьте имя, фамилию, телефон, банк (от 2 символов) и username."
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            bank = f"тел. {yc_phone} | банк: {bank}"
+        else:
+            if len(lines) < 4:
+                warn = await message.answer(
+                    "Нужно ровно 4 строки:\n"
+                    "• имя\n"
+                    "• фамилия\n"
+                    "• банк (с какого будет оплата)\n"
+                    "• @username в Telegram (или «—»)\n\n"
+                    "Пример:\n"
+                    "Иван\n"
+                    "Иванов\n"
+                    "Сбербанк\n"
+                    "@nickname"
+                )
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+            first_name, last_name, bank, tg_line = lines[0], lines[1], lines[2], lines[3]
+            user_name = f"{first_name} {last_name}".strip()
+            tg_u = _parse_tg_username_line(tg_line, message.from_user.username)
+            if len(first_name) < 1 or len(last_name) < 1 or len(bank) < 2:
+                warn = await message.answer("Проверьте имя, фамилию и название банка (минимум 2 символа).")
+                c = list(data.get("cleanup_ids", []))
+                c.extend([message.message_id, warn.message_id])
+                await state.update_data(cleanup_ids=c)
+                return
+    await state.update_data(
+        name=user_name,
+        phone=bank,
+        tg_username=tg_u,
+        yc_client_phone=yc_phone,
+    )
     await state.set_state(BookingStates.waiting_payment)
 
     data = await state.get_data()
@@ -2424,7 +2828,13 @@ async def enter_contacts(
     slot_text = data.get("slot_text")
     total = data.get("total")
     slot_ids = data.get("slot_ids") or []
-    hours = len(slot_ids)
+    shc2 = (data.get("slot_hours_caption") or "").strip()
+    hp2 = data.get("yclients_hour_pack")
+    if isinstance(hp2, dict) and int(hp2.get("hours") or 0) > 0:
+        hours = int(hp2["hours"])
+    else:
+        hours = len(slot_ids)
+    h_line2 = shc2 or str(hours)
     svc_line = html_escape(str(data.get("tariff_label") or pricing.service_title(product)))
     tg_disp = f"@{html_escape(tg_u)}" if tg_u else "—"
     use_yk_btn = bool(is_yookassa_configured(config) and pay_online)
@@ -2434,7 +2844,7 @@ async def enter_contacts(
             f"<b>Услуга:</b> {svc_line}\n"
             f"<b>Дата:</b> {day}\n"
             f"<b>Время:</b> {slot_text}\n"
-            f"<b>Часов:</b> {hours}\n"
+            f"<b>Длит./часов (тариф):</b> {h_line2}\n"
             f"<b>Итого:</b> {total} руб\n\n"
             f"<b>Имя:</b> {html_escape(user_name)}\n"
             f"<b>Telegram:</b> {tg_disp}\n\n"
@@ -2448,7 +2858,7 @@ async def enter_contacts(
             f"<b>Услуга:</b> {svc_line}\n"
             f"<b>Дата:</b> {day}\n"
             f"<b>Время:</b> {slot_text}\n"
-            f"<b>Часов:</b> {hours}\n"
+            f"<b>Длит./часов (тариф):</b> {h_line2}\n"
             f"<b>Итого:</b> {total} руб\n\n"
             f"{dest}\n\n"
             f"<b>Данные:</b> {html_escape(user_name)}\n"
@@ -2695,17 +3105,167 @@ async def paid(
 
     services_human = str(data.get("tariff_label") or pricing.service_title(str(product)))
 
-    booking_id = await db.create_booking(
-        user_id=callback.from_user.id,
-        user_name=data["name"],
-        phone=data["phone"],
-        tg_username=(data.get("tg_username") or callback.from_user.username or ""),
-        requires_engineer=(product == "with_engineer"),
-        slot_ids=[int(x) for x in data["slot_ids"]],
-        services=services_human,
-        total_price=int(data["total"]),
-        status="awaiting_yookassa" if use_yk else "pending_payment",
+    slot_ids_c = [int(x) for x in data.get("slot_ids") or []]
+    yc_st = bool(data.get("yclients_studio")) and slot_ids_c and all(x < 0 for x in slot_ids_c)
+    hour_pack_raw = data.get("yclients_hour_pack")
+    yc_hour_pack = (
+        isinstance(hour_pack_raw, dict)
+        and bool(data.get("yclients_studio"))
+        and int(hour_pack_raw.get("hours") or 0) in (1, 2, 3, 4)
     )
+
+    if yc_hour_pack:
+        hp = hour_pack_raw  # type: ignore[assignment]
+        day_yc = str(data.get("day") or "")
+        try:
+            start_idx = int(hp.get("start_idx", -1))
+            pack_hours = int(hp.get("hours", 0))
+            svc_pack = int(hp.get("service_id", 0))
+        except (TypeError, ValueError):
+            await callback.answer("Сессия устарела. Начните запись снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        if not day_yc or start_idx < 0 or svc_pack <= 0:
+            await callback.answer("Сессия устарела. Начните запись снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        if int(svc_pack) != int(yc.service_id_for_hours_pack(config, pack_hours)):
+            await callback.answer("Данные записи устарели. Выберите время снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        phone_api = (data.get("yc_client_phone") or "").strip() or yc.normalize_ru_phone(
+            str(data.get("phone") or "")
+        )
+        if len(phone_api) < 10:
+            await callback.answer("Нужен корректный телефон для Yclients. Введите контакты снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        verified = await yc.verify_hour_pack_ready(
+            config,
+            day_yyyy_mm_dd=day_yc,
+            start_idx=start_idx,
+            hours=pack_hours,
+        )
+        if not verified:
+            await callback.answer(
+                "Слот больше недоступен на выбранную длительность. Откройте календарь и выберите время снова.",
+                show_alert=True,
+            )
+            await state.update_data(paid_processing=False)
+            return
+        _, nh_seance = verified
+        api_id = f"tg{callback.from_user.id}-{day_yc}-pack{pack_hours}h-{start_idx}"
+        try:
+            yc_rec_id, _yc_payload = await yc.create_yclients_studio_record_pack(
+                config,
+                day=day_yc,
+                record_seance=nh_seance,
+                service_id=svc_pack,
+                client_name=str(data.get("name") or "Клиент"),
+                client_phone_digits=phone_api,
+                api_id=api_id,
+            )
+        except YclientsError as e:
+            logger.warning("Yclients create pack: %s", e)
+            await callback.answer(
+                f"Yclients: не удалось оформить запись. {str(e)[:180]}",
+                show_alert=True,
+            )
+            await state.update_data(paid_processing=False)
+            return
+        ui_sl = yc.seances_to_ui_slots([nh_seance], config)
+        st0 = str(ui_sl[0]["start_time"])
+        en0 = str(ui_sl[0]["end_time"])
+        booking_id = await db.create_booking_studio_yclients(
+            user_id=callback.from_user.id,
+            user_name=str(data.get("name") or ""),
+            phone=str(data.get("phone") or ""),
+            tg_username=(data.get("tg_username") or callback.from_user.username or ""),
+            requires_engineer=(product == "with_engineer"),
+            day=day_yc,
+            start_time=st0,
+            end_time=en0,
+            booked_slot_ids_csv=f"yc_pack:{pack_hours}h:{svc_pack}:{start_idx}",
+            services=services_human,
+            total_price=int(data["total"]),
+            status="awaiting_yookassa" if use_yk else "pending_payment",
+            yclients_record_id=yc_rec_id,
+        )
+    elif yc_st:
+        day_yc = str(data.get("day") or "")
+        seances_yc = data.get("yclients_seances") or []
+        if not day_yc or not isinstance(seances_yc, list) or not seances_yc:
+            await callback.answer("Сессия устарела. Начните запись в календаре снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        phone_api = (data.get("yc_client_phone") or "").strip() or yc.normalize_ru_phone(
+            str(data.get("phone") or "")
+        )
+        if len(phone_api) < 10:
+            await callback.answer("Нужен корректный телефон для Yclients. Введите контакты снова.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        try:
+            fresh_se, _ = await yc.load_day_seances_and_slots(config, day_yc)
+        except YclientsError as e:
+            logger.warning("Yclients paid refresh: %s", e)
+            await callback.answer("Yclients недоступен. Попробуйте позже.", show_alert=True)
+            await state.update_data(paid_processing=False)
+            return
+        if not yc.selection_still_fresh(slot_ids_c, seances_yc, fresh_se, config):
+            await callback.answer(
+                "Свободные слоты изменились. Откройте «Записаться» и выберите время снова.",
+                show_alert=True,
+            )
+            await state.update_data(paid_processing=False)
+            return
+        api_id = f"tg{callback.from_user.id}-{day_yc}-{min(slot_ids_c)}x{len(slot_ids_c)}"
+        try:
+            yc_rec_id, _yc_payload = await yc.create_yclients_studio_record(
+                config,
+                seances=seances_yc,
+                selected_neg_ids=slot_ids_c,
+                day=day_yc,
+                client_name=str(data.get("name") or "Клиент"),
+                client_phone_digits=phone_api,
+                api_id=api_id,
+            )
+        except YclientsError as e:
+            logger.warning("Yclients create: %s", e)
+            await callback.answer(
+                f"Yclients: не удалось оформить запись. {str(e)[:180]}",
+                show_alert=True,
+            )
+            await state.update_data(paid_processing=False)
+            return
+        st0, en0 = yc.booking_time_bounds(seances_yc, slot_ids_c, config)
+        booking_id = await db.create_booking_studio_yclients(
+            user_id=callback.from_user.id,
+            user_name=str(data.get("name") or ""),
+            phone=str(data.get("phone") or ""),
+            tg_username=(data.get("tg_username") or callback.from_user.username or ""),
+            requires_engineer=(product == "with_engineer"),
+            day=day_yc,
+            start_time=st0,
+            end_time=en0,
+            booked_slot_ids_csv=",".join(str(x) for x in slot_ids_c),
+            services=services_human,
+            total_price=int(data["total"]),
+            status="awaiting_yookassa" if use_yk else "pending_payment",
+            yclients_record_id=yc_rec_id,
+        )
+    else:
+        booking_id = await db.create_booking(
+            user_id=callback.from_user.id,
+            user_name=data["name"],
+            phone=data["phone"],
+            tg_username=(data.get("tg_username") or callback.from_user.username or ""),
+            requires_engineer=(product == "with_engineer"),
+            slot_ids=slot_ids_c,
+            services=services_human,
+            total_price=int(data["total"]),
+            status="awaiting_yookassa" if use_yk else "pending_payment",
+        )
     if not booking_id:
         await callback.answer("Не удалось создать запись. Возможно слот уже занят.", show_alert=True)
         await state.update_data(paid_processing=False)
@@ -2728,6 +3288,9 @@ async def paid(
         f"<b>Услуги:</b> {html_escape(str(booking['services']))}\n"
         f"<b>Сумма:</b> {booking['total_price']} руб"
     )
+    yc_id = booking.get("yclients_record_id")
+    if yc_id:
+        admin_text += f"\n<b>Yclients (CRM):</b> <code>#{yc_id}</code>"
     if use_yk:
         admin_text += (
             "\n\n<i>Клиент оплачивает через ЮKassa — после оплаты заявка подтвердится автоматически.</i>"
@@ -3213,6 +3776,12 @@ async def reschedule_start(
     if (booking.get("booking_kind") or "studio") != "studio" or booking.get("status") != "active":
         await callback.answer(
             "Перенос доступен только для подтверждённой записи на студию.",
+            show_alert=True,
+        )
+        return
+    if booking.get("yclients_record_id") and yc.yclients_studio_enabled(config):
+        await callback.answer(
+            "Перенос для записи из Yclients пока в CRM: напишите в студию или администратору.",
             show_alert=True,
         )
         return

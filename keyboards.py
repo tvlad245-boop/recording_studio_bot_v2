@@ -220,6 +220,49 @@ def slots_pick_kb(slots: list[dict], selected_ids: set[int]) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def yclients_start_kb(slots: list[dict]) -> InlineKeyboardMarkup:
+    """Старты записи (1 ч в CRM): одна кнопка — один слот, дальше выбор длительности."""
+    _sp = "\u2800"
+
+    def _btn(slot: dict) -> InlineKeyboardButton:
+        sid = int(slot["id"])
+        idx = max(0, -sid - 1)
+        label = f"{slot['start_time']}→…"
+        if not Database.slot_row_is_active(slot["is_active"]):
+            return InlineKeyboardButton(text=f"❌ {label}", callback_data="noop")
+        return InlineKeyboardButton(text=f"✅ {label}", callback_data=f"yc_st:{idx}")
+
+    def _start_hour(slot: dict) -> int:
+        h, _ = Database.time_sort_key(Database._coerce_cell_str(slot["start_time"]))
+        return int(h)
+
+    left_slots = [s for s in slots if _start_hour(s) < 12]
+    right_slots = [s for s in slots if _start_hour(s) >= 12]
+    rows: list[list[InlineKeyboardButton]] = []
+    n_rows = max(len(left_slots), len(right_slots))
+    for i in range(n_rows):
+        left = _btn(left_slots[i]) if i < len(left_slots) else InlineKeyboardButton(text=_sp, callback_data="noop")
+        right = _btn(right_slots[i]) if i < len(right_slots) else InlineKeyboardButton(text=_sp, callback_data="noop")
+        rows.append([left, right])
+    rows.append([InlineKeyboardButton(text="⬅ К календарю", callback_data="book:calendar")])
+    rows.append([InlineKeyboardButton(text="⬅ В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def yclients_hours_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="1 ч", callback_data="yc_h:1"),
+        InlineKeyboardButton(text="2 ч", callback_data="yc_h:2"),
+        InlineKeyboardButton(text="3 ч", callback_data="yc_h:3"),
+        InlineKeyboardButton(text="4 ч", callback_data="yc_h:4"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅ Другое время", callback_data="yc_back:start"))
+    kb.row(InlineKeyboardButton(text="⬅ К календарю", callback_data="book:calendar"))
+    kb.row(InlineKeyboardButton(text="⬅ В меню", callback_data="menu:home"))
+    return kb.as_markup()
+
+
 def slots_rs_pick_kb(slots: list[dict], selected_ids: set[int]) -> InlineKeyboardMarkup:
     """Сетка слотов для переноса записи (отдельные callback от обычной записи)."""
     _sp = "\u2800"

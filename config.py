@@ -72,6 +72,26 @@ class Config:
     yookassa_secret_key: str
     yookassa_return_url: str
 
+    # Yclients REST API (https://developers.yclients.com). company_id=0 — интеграция выключена.
+    yclients_partner_token: str
+    yclients_user_token: str
+    yclients_company_id: int
+    yclients_default_staff_id: int
+    # Через запятую: id услуг для book_times (для проверки и будущего бронирования), например "12345"
+    yclients_service_ids_csv: str
+    # Отдельные услуги Yclients по длительности (1–4 ч). Если все четыре > 0 — режим «время → длительность»
+    # и цена из CRM (book_services); иначе старый сценарий с несколькими слотами подряд по CSV.
+    yclients_service_id_1h: int
+    yclients_service_id_2h: int
+    yclients_service_id_3h: int
+    yclients_service_id_4h: int
+    # 1 = почасовая запись и слоты из Yclients (book_times + POST /records), иначе только локальная SQLite сетка.
+    yclients_studio: bool
+
+    # Идентификатор сборки/деплоя (для проверки обновлений в админке).
+    # Рекомендуется задавать в окружении (CI/CD): BUILD_ID или GIT_SHA.
+    build_id: str
+
 
 def payments_inbox_chat_id(cfg: Config) -> int:
     return cfg.payments_chat_id if cfg.payments_chat_id else cfg.admin_id
@@ -223,6 +243,25 @@ def load_config() -> Config:
         os.getenv("YOOKASSA_RETURN_URL", "").strip() or "https://yookassa.ru"
     )
 
+    yclients_partner_token = _env_first("YCLIENTS_PARTNER_TOKEN", "YCLIENTS_APP_PARTNER_TOKEN")
+    yclients_user_token = _env_first("YCLIENTS_USER_TOKEN", "YCLIENTS_APP_USER_TOKEN")
+    yclients_company_id = _int_env("YCLIENTS_COMPANY_ID", 0)
+    yclients_default_staff_id = _int_env("YCLIENTS_DEFAULT_STAFF_ID", 0)
+    yclients_service_ids_csv = os.getenv("YCLIENTS_SERVICE_IDS", "").strip()
+    yclients_service_id_1h = _int_env("YCLIENTS_SERVICE_ID_1H", 0)
+    yclients_service_id_2h = _int_env("YCLIENTS_SERVICE_ID_2H", 0)
+    yclients_service_id_3h = _int_env("YCLIENTS_SERVICE_ID_3H", 0)
+    yclients_service_id_4h = _int_env("YCLIENTS_SERVICE_ID_4H", 0)
+    # YCLIENTS_STUDIO=1 — календарь/слоты для «Почасовой записи» с CRM Yclients
+    yclients_studio = (os.getenv("YCLIENTS_STUDIO", "0") or "0").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+    build_id = _env_first("BUILD_ID", "GIT_SHA", "RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT_SHA") or "dev"
+
     return Config(
         bot_token=token,
         admin_id=admin_id,
@@ -267,5 +306,16 @@ def load_config() -> Config:
         yookassa_shop_id=yookassa_shop_id,
         yookassa_secret_key=yookassa_secret_key,
         yookassa_return_url=yookassa_return_url,
+        yclients_partner_token=yclients_partner_token,
+        yclients_user_token=yclients_user_token,
+        yclients_company_id=yclients_company_id,
+        yclients_default_staff_id=yclients_default_staff_id,
+        yclients_service_ids_csv=yclients_service_ids_csv,
+        yclients_service_id_1h=yclients_service_id_1h,
+        yclients_service_id_2h=yclients_service_id_2h,
+        yclients_service_id_3h=yclients_service_id_3h,
+        yclients_service_id_4h=yclients_service_id_4h,
+        yclients_studio=yclients_studio,
+        build_id=build_id,
     )
 

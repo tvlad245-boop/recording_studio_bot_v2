@@ -7,6 +7,7 @@ from datetime import date
 from html import escape as html_escape
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.enums import ParseMode
@@ -44,11 +45,18 @@ from services.channel_settings import (
 from services.content_settings import tariff_day_start_list, tariff_night_start_list
 from services.effective_pricing import EffectivePricing, build_default_settings_dict, load_effective_pricing
 from services.reminders import ReminderService
+from services.yclients_client import (
+    YclientsError,
+    parse_service_ids_csv,
+    yclients_book_times,
+    yclients_is_configured,
+)
 from states import AdminStates
 
 
 router = Router()
 logger = logging.getLogger(__name__)
+_BOOT_UTC = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 ADMIN_HOME_HTML = "<b>🛠 Админ-панель</b>"
 
@@ -676,6 +684,8 @@ def admin_menu_kb():
     kb.button(text="📡 Каналы и чаты", callback_data="admin:channels")
     kb.button(text="✉️ Тексты для клиентов", callback_data="admin:client_texts")
     kb.button(text="📇 Контакты и реквизиты", callback_data="admin:contacts")
+    kb.button(text="🔌 Проверка Yclients", callback_data="admin:yclients_ping")
+    kb.button(text="ℹ️ Версия", callback_data="admin:version")
     kb.button(text="⬅ В меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -918,6 +928,74 @@ async def admin_actions(
             _contacts_menu_kb(),
         )
         await callback.answer()
+        return
+
+    if action == "yclients_ping":
+        await state.clear()
+        # Сразу отвечаем, чтобы в Telegram не висели «часики» при долгом HTTP.
+        try:
+            await callback.answer("Проверяю Yclients…")
+        except Exception:
+            pass
+        if not yclients_is_configured(config):
+            try:
+                await callback.message.answer(
+                    "Yclients: интеграция не настроена.\n\n"
+                    "В .env задайте:\n"
+                    "• YCLIENTS_COMPANY_ID\n"
+                    "• YCLIENTS_USER_TOKEN (или YCLIENTS_PARTNER_TOKEN)\n"
+                    "Опционально: YCLIENTS_SERVICE_IDS, YCLIENTS_DEFAULT_STAFF_ID\n\n"
+                    "Важно: в токены вставляйте только сами значения, без 'Bearer'/'User'."
+                )
+            except Exception:
+                pass
+            return
+        today = date.today().isoformat()
+        staff = int(config.yclients_default_staff_id or 0)
+        sids = parse_service_ids_csv(config.yclients_service_ids_csv)
+        try:
+            slots = await yclients_book_times(
+                config,
+                staff_id=staff,
+                date_yyyy_mm_dd=today,
+                service_ids=sids or None,
+            )
+        except YclientsError as e:
+            msg = str(e)[:180]
+            try:
+                await callback.message.answer(f"Yclients: {html_escape(msg)}", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            logger.exception("yclients_ping failed")
+            try:
+                await callback.message.answer(
+                    f"Yclients: ошибка запроса ({html_escape(type(e).__name__)})",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+        n = len(slots)
+        preview = ", ".join(str(x.get("time", "?")) for x in slots[:8])
+        if len(slots) > 8:
+            preview += "…"
+        tail = f" Интервалов: {n}. {preview}".strip()
+        if len(tail) > 190:
+            tail = tail[:187] + "…"
+        try:
+            await callback.message.answer(f"Yclients OK. {html_escape(tail)}", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    if action == "version":
+        await state.clear()
+        bid = (getattr(config, "build_id", "") or "dev").strip()
+        # В alert ограничение по длине, поэтому коротко.
+        msg = f"Build: {bid}\nBoot(UTC): {_BOOT_UTC}"
+        await callback.answer(msg[:190], show_alert=True)
         return
 
     if action == "schedule_slots":

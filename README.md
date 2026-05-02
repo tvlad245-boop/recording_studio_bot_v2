@@ -44,3 +44,5 @@ python bot.py
 - `/start` — главное меню
 - `/admin` — админ-панель (только `ADMIN_ID`)
 
+"# recording_studio_bot_no_crm" 
+"# recording_studio_bot_no_crm" 

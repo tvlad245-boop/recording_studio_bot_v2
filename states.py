@@ -9,6 +9,8 @@ class BookingStates(StatesGroup):
     choosing_tariff_date = State()
     choosing_date = State()
     choosing_slot = State()
+    choosing_yc_start = State()
+    choosing_yc_hours = State()
     entering_brief = State()
     entering_contacts = State()
     waiting_payment = State()
