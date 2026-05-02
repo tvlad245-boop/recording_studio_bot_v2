@@ -102,6 +102,46 @@ def parse_service_ids_csv(csv: str) -> list[int]:
     return out
 
 
+async def yclients_book_services(
+    cfg: Config,
+    *,
+    staff_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    GET /book_services/{company_id}
+
+    Список услуг, доступных для бронирования (в т.ч. price_min / price_max).
+    При необходимости ограничиваем выбор услуг мастера через staff_id (>0).
+    """
+    if not cfg.yclients_company_id:
+        raise YclientsError("YCLIENTS_COMPANY_ID не задан")
+    url = f"{YCLIENTS_API_BASE}/book_services/{int(cfg.yclients_company_id)}"
+    params: list[tuple[str, str]] | None = None
+    if staff_id is not None and int(staff_id) > 0:
+        params = [("staff_id", str(int(staff_id)))]
+    headers = _default_headers(cfg)
+    timeout = httpx.Timeout(connect=8.0, read=12.0, write=8.0, pool=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers, params=params)
+    except httpx.TimeoutException as e:
+        raise YclientsError("Timeout при запросе book_services в Yclients.") from e
+    except httpx.HTTPError as e:
+        raise YclientsError(f"HTTP ошибка book_services: {type(e).__name__}") from e
+    if r.status_code >= 400:
+        logger.warning("yclients book_services HTTP %s: %s", r.status_code, r.text[:500])
+        raise YclientsError(f"HTTP {r.status_code}: {r.text[:200]}")
+    payload = r.json()
+    if not payload.get("success"):
+        raise YclientsError(str(payload)[:500])
+    data = payload.get("data")
+    if isinstance(data, dict):
+        svcs = data.get("services")
+        if isinstance(svcs, list):
+            return [x for x in svcs if isinstance(x, dict)]
+    return []
+
+
 async def yclients_book_times(
     cfg: Config,
     *,
